@@ -1,0 +1,25 @@
+# Build outputs
+/build/
+/dist/
+/out/
+
+# Runtime logs and local captures
+/logs/
+*.log
+*.dmp
+*.tmp
+
+# Windhawk/Windows local state
+*.pdb
+*.ilk
+*.obj
+*.exp
+*.lib
+
+# Editor and OS noise
+.vs/
+.vscode/
+*.user
+*.suo
+Thumbs.db
+Desktop.ini
