@@ -171,6 +171,9 @@ In `Custom hotkey` mode, `customProcessName` is required to detect the foregroun
 | `transitionCaptureMs` | `3500` | Number | Maximum capture window during launcher activation. Clamped to 50-10000 ms. |
 | `transitionIdleMs` | `80` | Number | Time without input before a transaction completes. Clamped to 0-1000 ms. |
 | `redirectWinS` | `true` | Toggle | Redirect the `Win+S` shortcut. |
+| `redirectWinQ` | `true` | Toggle | Redirect the `Win+Q` Search shortcut. |
+| `redirectWinC` | `true` | Toggle | Redirect `Win+C` when it is configured to open Windows Search. |
+| `autoDetectWinCSearchShortcut` | `true` | Toggle | Check `HKCU\Software\Microsoft\Windows\Shell\BrandedKey\BrandedKeyChoiceType` and only redirect `Win+C` when it is set to `Search`. Disable this to force `redirectWinC` manually. |
 | `redirectStartMenuTyping` | `true` | Toggle | Redirect direct typing, paste and backspace while `StartMenuExperienceHost.exe` is foreground. |
 | `redirectSearchHostTyping` | `true` | Toggle | Redirect direct typing, paste and backspace while `SearchHost.exe` is foreground. Disable this to keep only Start menu typing redirection. |
 | `redirectStartMenuSearchBoxClick` | `true` | Toggle | Redirect clicks/taps on the Start menu search box, including UI Automation fallback. |
@@ -186,6 +189,8 @@ All settings are published through an atomic snapshot guarded by an `SRWLOCK`. R
 The redirect toggles enable or disable redirection layers, not necessarily the physical installation of hooks. Hooks may still be installed so settings can change at runtime, but disabled layers pass through to the original Windows behavior.
 
 Some Windows Search entry points are covered by multiple fallback layers. To fully restore a native path, disable both the specific entry-point setting and broader fallback layers such as `redirectUndockedSearch` or `redirectSearchHostTyping` when applicable. `redirectSearchHostTyping` only controls text typed while `SearchHost.exe` is already foreground, and is independent from `redirectTaskbarSearch`.
+
+`Win+C` auto-detection uses the Windows Copilot key/Win+C registry setting. `Win+Q` is a known Search shortcut and is controlled by its own toggle directly.
 
 ## Toolchain
 

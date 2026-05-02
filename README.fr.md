@@ -171,6 +171,9 @@ En mode `Custom hotkey`, `customProcessName` est requis pour détecter le foregr
 | `transitionCaptureMs` | `3500` | Nombre | Fenêtre max de capture pendant l'ouverture. Bornée à 50-10000 ms. |
 | `transitionIdleMs` | `80` | Nombre | Temps sans input avant fin de transaction. Borné à 0-1000 ms. |
 | `redirectWinS` | `true` | Toggle | Redirige le raccourci `Win+S`. |
+| `redirectWinQ` | `true` | Toggle | Redirige le raccourci Search `Win+Q`. |
+| `redirectWinC` | `true` | Toggle | Redirige `Win+C` lorsqu'il est configuré pour ouvrir Windows Search. |
+| `autoDetectWinCSearchShortcut` | `true` | Toggle | Vérifie `HKCU\Software\Microsoft\Windows\Shell\BrandedKey\BrandedKeyChoiceType` et ne redirige `Win+C` que lorsque la valeur est `Search`. Désactive-le pour forcer `redirectWinC` manuellement. |
 | `redirectStartMenuTyping` | `true` | Toggle | Redirige la frappe directe, le collage et backspace lorsque `StartMenuExperienceHost.exe` est foreground. |
 | `redirectSearchHostTyping` | `true` | Toggle | Redirige la frappe directe, le collage et backspace lorsque `SearchHost.exe` est foreground. Désactive-le pour ne garder que la frappe dans le menu Démarrer. |
 | `redirectStartMenuSearchBoxClick` | `true` | Toggle | Redirige les clics/taps sur la search box du Start, fallback UI Automation inclus. |
@@ -186,6 +189,8 @@ Tous les paramètres sont publiés via un snapshot atomique protégé par un `SR
 Les toggles activent ou désactivent des couches de redirection, pas forcément l'installation physique des hooks. Les hooks peuvent rester installés pour permettre les changements de settings à chaud, mais les couches désactivées repassent vers le comportement Windows original.
 
 Certains points d'entrée Windows Search sont couverts par plusieurs couches de fallback. Pour restaurer complètement un chemin natif, désactive à la fois le réglage spécifique et les couches plus larges comme `redirectUndockedSearch` ou `redirectSearchHostTyping` quand c'est pertinent. `redirectSearchHostTyping` ne contrôle que le texte tapé lorsque `SearchHost.exe` est déjà foreground, et reste indépendant de `redirectTaskbarSearch`.
+
+L'auto-détection de `Win+C` utilise le réglage registre Windows de la touche Copilot/Win+C. `Win+Q` est un raccourci Search connu et est contrôlé directement par son propre toggle.
 
 ## Toolchain
 
