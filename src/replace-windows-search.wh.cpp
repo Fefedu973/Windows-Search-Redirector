@@ -1,7 +1,7 @@
 // ==WindhawkMod==
 // @id              replace-windows-search-with-app
-// @name            Replace Windows Search with launcher
-// @description     Replaces Windows Search entry points with Command Palette or a custom launcher and forwards initial text
+// @name            Windows Search Redirector
+// @description     Redirects Windows Search to Command Palette, PowerToys Run, or a custom launcher and forwards initial text
 // @version         1.0.0
 // @author          Fefedu973
 // @include         explorer.exe
@@ -13,7 +13,7 @@
 
 // ==WindhawkModReadme==
 /*
-# Replace Windows Search with launcher
+# Windows Search Redirector
 
 Replaces Windows Search entry points with PowerToys Command Palette or another
 configured launcher, and forwards the text that was already typed or pasted
