@@ -78,7 +78,7 @@ Les hooks symboles Windows sont fragiles par nature: les PDB changent selon les 
 sequenceDiagram
     participant U as Utilisateur
     participant K as Hook clavier
-    participant S as SharedState v4
+    participant S as SharedState v5
     participant L as Thread launcher
     participant C as Command Palette
 
@@ -170,10 +170,22 @@ En mode `Custom hotkey`, `customProcessName` est requis pour détecter le foregr
 | `debounceMs` | `300` | Nombre | Anti double-lancement global. Borné à 0-5000 ms. |
 | `transitionCaptureMs` | `3500` | Nombre | Fenêtre max de capture pendant l'ouverture. Bornée à 50-10000 ms. |
 | `transitionIdleMs` | `80` | Nombre | Temps sans input avant fin de transaction. Borné à 0-1000 ms. |
+| `redirectWinS` | `true` | Toggle | Redirige le raccourci `Win+S`. |
+| `redirectStartMenuTyping` | `true` | Toggle | Redirige la frappe directe, le collage et backspace lorsque `StartMenuExperienceHost.exe` est foreground. |
+| `redirectSearchHostTyping` | `true` | Toggle | Redirige la frappe directe, le collage et backspace lorsque `SearchHost.exe` est foreground. Désactive-le pour ne garder que la frappe dans le menu Démarrer. |
+| `redirectStartMenuSearchBoxClick` | `true` | Toggle | Redirige les clics/taps sur la search box du Start, fallback UI Automation inclus. |
+| `redirectStartMenuSearchTransitions` | `true` | Toggle | Redirige les requêtes privées StartDocked de focus/ouverture Search. |
+| `redirectTaskbarSearch` | `true` | Toggle | Redirige le bouton Search de la taskbar et les hooks d'activation SearchHost. |
+| `redirectUndockedSearch` | `true` | Toggle | Redirige les hooks twinui/Windows Search undocked. |
+| `redirectSearchProtocol` | `true` | Toggle | Redirige les lancements `ms-search:`, `search-ms:` et `ms-searchassistant:`. |
 | `allowInjectedInput` | `true` | Toggle | Autorise les outils de test à générer des touches synthétiques. |
 | `log` | `false` | Toggle | Active les logs debug sans écrire le contenu tapé/collé. |
 
-Tous les paramètres sont publiés via un snapshot atomique protégé par un `SRWLOCK`. `Wh_ModSettingsChanged` reconstruit un snapshot complet, ce qui empêche les races sur les `std::wstring` lorsque les settings changent pendant que les hooks sont actifs.
+Tous les paramètres sont publiés via un snapshot atomique protégé par un `SRWLOCK`. Les toggles de redirection sont aussi reflétés dans des flags atomiques pour laisser passer rapidement les chemins désactivés depuis les hooks bas niveau. `Wh_ModSettingsChanged` reconstruit un snapshot complet, ce qui empêche les races sur les `std::wstring` lorsque les settings changent pendant que les hooks sont actifs.
+
+Les toggles activent ou désactivent des couches de redirection, pas forcément l'installation physique des hooks. Les hooks peuvent rester installés pour permettre les changements de settings à chaud, mais les couches désactivées repassent vers le comportement Windows original.
+
+Certains points d'entrée Windows Search sont couverts par plusieurs couches de fallback. Pour restaurer complètement un chemin natif, désactive à la fois le réglage spécifique et les couches plus larges comme `redirectUndockedSearch` ou `redirectSearchHostTyping` quand c'est pertinent. `redirectSearchHostTyping` ne contrôle que le texte tapé lorsque `SearchHost.exe` est déjà foreground, et reste indépendant de `redirectTaskbarSearch`.
 
 ## Toolchain
 

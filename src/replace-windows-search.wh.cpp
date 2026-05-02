@@ -19,17 +19,6 @@ Replaces Windows Search entry points with PowerToys Command Palette or another
 configured launcher, and forwards the text that was already typed or pasted
 while the replacement launcher is opening.
 
-```mermaid
-flowchart TD
-    A["User triggers Search"] --> B{"Can replacement launcher run?"}
-    B -->|"No"| C["Let Windows Search handle it"]
-    B -->|"Yes"| D["Block native Search"]
-    D --> E["Buffer typed/pasted text"]
-    E --> F["Open launcher"]
-    F --> G["Wait for replacement foreground"]
-    G --> H["Paste original clipboard or inject Unicode text"]
-```
-
 Main interception layers:
 
 - `explorer.exe`: low-level keyboard/mouse hooks, Search protocol fallback,
@@ -99,6 +88,44 @@ settings reference and testing commands.
   $description: >-
     Once no more input was captured for this duration and the launcher is
     foreground, the buffered text transaction is considered complete.
+- redirectWinS: true
+  $name: Redirect Win+S
+  $description: Open the replacement launcher when Win+S is pressed.
+- redirectStartMenuTyping: true
+  $name: Redirect typing in Start menu
+  $description: >-
+    Redirect direct typing, paste and backspace while StartMenuExperienceHost.exe
+    is foreground. Transition capture after another enabled trigger still works.
+- redirectSearchHostTyping: true
+  $name: Redirect typing in Windows Search
+  $description: >-
+    Redirect direct typing, paste and backspace while SearchHost.exe is
+    foreground. This is independent from taskbar Search redirection. Disable it
+    if you only want Start menu typing redirection.
+- redirectStartMenuSearchBoxClick: true
+  $name: Redirect Start search box clicks
+  $description: >-
+    Redirect clicks/taps on the Start menu search box, including the UI
+    Automation fallback.
+- redirectStartMenuSearchTransitions: true
+  $name: Redirect Start search transitions
+  $description: >-
+    Redirect private StartDocked focus/open-search requests that normally move
+    the Start menu into Windows Search.
+- redirectTaskbarSearch: true
+  $name: Redirect taskbar Search
+  $description: >-
+    Redirect taskbar Search button and SearchHost activation paths. Broader
+    fallback layers can still apply if enabled.
+- redirectUndockedSearch: true
+  $name: Redirect undocked Windows Search
+  $description: >-
+    Redirect twinui/undocked Windows Search activation paths when those private
+    hooks are available.
+- redirectSearchProtocol: true
+  $name: Redirect search protocols
+  $description: >-
+    Redirect ms-search:, search-ms: and ms-searchassistant: launches.
 - allowInjectedInput: true
   $name: Capture injected input
   $description: >-
@@ -155,6 +182,14 @@ struct SettingsSnapshot {
     DWORD transitionIdleMs = 80;
     bool allowInjectedInput = true;
     bool requireLauncherAvailable = true;
+    bool redirectWinS = true;
+    bool redirectStartMenuTyping = true;
+    bool redirectSearchHostTyping = true;
+    bool redirectStartMenuSearchBoxClick = true;
+    bool redirectStartMenuSearchTransitions = true;
+    bool redirectTaskbarSearch = true;
+    bool redirectUndockedSearch = true;
+    bool redirectSearchProtocol = true;
     LauncherTarget launcherTarget = LauncherTarget::CommandPalette;
     std::wstring customHotkey;
     std::wstring customCommand;
@@ -165,6 +200,14 @@ struct SettingsSnapshot {
 static SRWLOCK g_settingsLock = SRWLOCK_INIT;
 static SettingsSnapshot g_settings;
 static volatile LONG g_logEnabled = 0;
+static volatile LONG g_redirectWinSEnabled = 1;
+static volatile LONG g_redirectStartMenuTypingEnabled = 1;
+static volatile LONG g_redirectSearchHostTypingEnabled = 1;
+static volatile LONG g_redirectStartMenuSearchBoxClickEnabled = 1;
+static volatile LONG g_redirectStartMenuSearchTransitionsEnabled = 1;
+static volatile LONG g_redirectTaskbarSearchEnabled = 1;
+static volatile LONG g_redirectUndockedSearchEnabled = 1;
+static volatile LONG g_redirectSearchProtocolEnabled = 1;
 static volatile LONG64 g_targetAvailableCacheTick = 0;
 static volatile LONG g_targetAvailableCacheValue = 0;
 static volatile LONG64 g_ignoreInjectedUntilTick = 0;
@@ -258,6 +301,21 @@ static void LoadSettings() {
     next.allowInjectedInput = Wh_GetIntSetting(L"allowInjectedInput") != 0;
     next.requireLauncherAvailable =
         Wh_GetIntSetting(L"requireLauncherAvailable") != 0;
+    next.redirectWinS = Wh_GetIntSetting(L"redirectWinS") != 0;
+    next.redirectStartMenuTyping =
+        Wh_GetIntSetting(L"redirectStartMenuTyping") != 0;
+    next.redirectSearchHostTyping =
+        Wh_GetIntSetting(L"redirectSearchHostTyping") != 0;
+    next.redirectStartMenuSearchBoxClick =
+        Wh_GetIntSetting(L"redirectStartMenuSearchBoxClick") != 0;
+    next.redirectStartMenuSearchTransitions =
+        Wh_GetIntSetting(L"redirectStartMenuSearchTransitions") != 0;
+    next.redirectTaskbarSearch =
+        Wh_GetIntSetting(L"redirectTaskbarSearch") != 0;
+    next.redirectUndockedSearch =
+        Wh_GetIntSetting(L"redirectUndockedSearch") != 0;
+    next.redirectSearchProtocol =
+        Wh_GetIntSetting(L"redirectSearchProtocol") != 0;
     bool logEnabled = Wh_GetIntSetting(L"log") != 0;
 
     next.customHotkey = readStringSetting(L"customHotkey");
@@ -270,6 +328,22 @@ static void LoadSettings() {
     ReleaseSRWLockExclusive(&g_settingsLock);
 
     InterlockedExchange(&g_logEnabled, logEnabled ? 1 : 0);
+    InterlockedExchange(&g_redirectWinSEnabled,
+                        next.redirectWinS ? 1 : 0);
+    InterlockedExchange(&g_redirectStartMenuTypingEnabled,
+                        next.redirectStartMenuTyping ? 1 : 0);
+    InterlockedExchange(&g_redirectSearchHostTypingEnabled,
+                        next.redirectSearchHostTyping ? 1 : 0);
+    InterlockedExchange(&g_redirectStartMenuSearchBoxClickEnabled,
+                        next.redirectStartMenuSearchBoxClick ? 1 : 0);
+    InterlockedExchange(&g_redirectStartMenuSearchTransitionsEnabled,
+                        next.redirectStartMenuSearchTransitions ? 1 : 0);
+    InterlockedExchange(&g_redirectTaskbarSearchEnabled,
+                        next.redirectTaskbarSearch ? 1 : 0);
+    InterlockedExchange(&g_redirectUndockedSearchEnabled,
+                        next.redirectUndockedSearch ? 1 : 0);
+    InterlockedExchange(&g_redirectSearchProtocolEnabled,
+                        next.redirectSearchProtocol ? 1 : 0);
     InvalidateReplacementTargetAvailabilityCache();
 }
 
@@ -687,12 +761,6 @@ static bool TryBeginLaunch(DWORD debounceMs) {
     return true;
 }
 
-static bool IsLaunchInProgress() {
-    return g_sharedState &&
-           InterlockedCompareExchange(&g_sharedState->launchInProgress, 0, 0) !=
-               0;
-}
-
 static void EndLaunch() {
     if (g_sharedState) {
         InterlockedExchange(&g_sharedState->launchInProgress, 0);
@@ -727,6 +795,56 @@ static bool RequestReplacement(PCWSTR reason) {
     log_if(L"%s %s", reason ? reason : L"Search request",
            launched ? L"intercepted" : L"left to Windows Search: launch busy");
     return launched;
+}
+
+enum class RedirectCategory {
+    WinS,
+    StartMenuTyping,
+    SearchHostTyping,
+    StartMenuSearchBoxClick,
+    StartMenuSearchTransitions,
+    TaskbarSearch,
+    UndockedSearch,
+    SearchProtocol,
+};
+
+static bool IsFlagEnabled(volatile LONG* flag) {
+    return InterlockedCompareExchange(flag, 0, 0) != 0;
+}
+
+static bool IsRedirectCategoryEnabled(RedirectCategory category) {
+    switch (category) {
+        case RedirectCategory::WinS:
+            return IsFlagEnabled(&g_redirectWinSEnabled);
+
+        case RedirectCategory::StartMenuTyping:
+            return IsFlagEnabled(&g_redirectStartMenuTypingEnabled);
+
+        case RedirectCategory::SearchHostTyping:
+            return IsFlagEnabled(&g_redirectSearchHostTypingEnabled);
+
+        case RedirectCategory::StartMenuSearchBoxClick:
+            return IsFlagEnabled(&g_redirectStartMenuSearchBoxClickEnabled);
+
+        case RedirectCategory::StartMenuSearchTransitions:
+            return IsFlagEnabled(&g_redirectStartMenuSearchTransitionsEnabled);
+
+        case RedirectCategory::TaskbarSearch:
+            return IsFlagEnabled(&g_redirectTaskbarSearchEnabled);
+
+        case RedirectCategory::UndockedSearch:
+            return IsFlagEnabled(&g_redirectUndockedSearchEnabled);
+
+        case RedirectCategory::SearchProtocol:
+            return IsFlagEnabled(&g_redirectSearchProtocolEnabled);
+    }
+
+    return true;
+}
+
+static bool RequestReplacementIfCategoryEnabled(RedirectCategory category,
+                                                PCWSTR reason) {
+    return IsRedirectCategoryEnabled(category) && RequestReplacement(reason);
 }
 
 static std::wstring GetProcessNameFromPid(DWORD pid) {
@@ -814,8 +932,16 @@ static bool IsShellForeground(HWND hwnd, const std::wstring& processName) {
 
 static bool ShouldCaptureTypedSearchInput() {
     ForegroundSnapshot snapshot = CaptureForegroundSnapshotCached(75);
-    return _wcsicmp(snapshot.processName.c_str(), L"StartMenuExperienceHost.exe") == 0 ||
-           _wcsicmp(snapshot.processName.c_str(), L"SearchHost.exe") == 0;
+    if (_wcsicmp(snapshot.processName.c_str(),
+                 L"StartMenuExperienceHost.exe") == 0) {
+        return IsRedirectCategoryEnabled(RedirectCategory::StartMenuTyping);
+    }
+
+    if (_wcsicmp(snapshot.processName.c_str(), L"SearchHost.exe") == 0) {
+        return IsRedirectCategoryEnabled(RedirectCategory::SearchHostTyping);
+    }
+
+    return false;
 }
 
 static std::wstring TrimString(std::wstring value);
@@ -1096,6 +1222,10 @@ static void IgnoreUndockedSearchFor(DWORD durationMs = 1500) {
                       GetTickCount64() + durationMs);
 }
 
+static void StopIgnoringUndockedSearch() {
+    InterlockedExchange64(&g_ignoreUndockedSearchUntilTick, 0);
+}
+
 static bool IsUndockedSearchIgnored() {
     return IsLocalTickActive(&g_ignoreUndockedSearchUntilTick);
 }
@@ -1214,7 +1344,9 @@ static LRESULT CALLBACK LowLevelMouseProc(int nCode,
                                           LPARAM lParam) {
     if (nCode == HC_ACTION && wParam == WM_LBUTTONDOWN && lParam) {
         const auto* mouseInfo = reinterpret_cast<const MSLLHOOKSTRUCT*>(lParam);
-        if (IsStartSearchBoxAtPoint(mouseInfo->pt) &&
+        if (IsRedirectCategoryEnabled(
+                RedirectCategory::StartMenuSearchBoxClick) &&
+            IsStartSearchBoxAtPoint(mouseInfo->pt) &&
             RequestReplacement(L"Start menu search box UIA click")) {
             return 1;
         }
@@ -1266,11 +1398,13 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
 
         if (keyboardInfo->vkCode == 'S' && (leftWinDown || rightWinDown) &&
             !ctrlDown && !altDown && !shiftDown) {
-            if (RequestReplacement(L"Win+S")) {
+            if (IsRedirectCategoryEnabled(RedirectCategory::WinS) &&
+                RequestReplacement(L"Win+S")) {
                 ClearPendingText();
                 return 1;
             }
 
+            StopIgnoringUndockedSearch();
             return CallNextHookEx(g_keyboardHook, nCode, wParam, lParam);
         }
 
@@ -1360,6 +1494,9 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
 }
 
 static DWORD WINAPI KeyboardHookThreadProc(LPVOID) {
+    MSG dummy;
+    PeekMessageW(&dummy, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
+
     HRESULT coInit = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     g_uiAutomationComInitialized = SUCCEEDED(coInit);
     HRESULT uiaHr = CoCreateInstance(CLSID_CUIAutomation, nullptr,
@@ -1453,8 +1590,11 @@ static void StopKeyboardHookThread() {
         return;
     }
 
-    PostThreadMessageW(g_keyboardThreadId, WM_QUIT, 0, 0);
-    WaitForSingleObject(g_keyboardThread, 5000);
+    if (!PostThreadMessageW(g_keyboardThreadId, WM_QUIT, 0, 0)) {
+        Wh_Log(L"[ReplaceSearch] PostThreadMessageW(WM_QUIT) failed: %u",
+               GetLastError());
+    }
+    WaitForSingleObject(g_keyboardThread, INFINITE);
     CloseHandle(g_keyboardThread);
     g_keyboardThread = nullptr;
     g_keyboardThreadId = 0;
@@ -1710,17 +1850,44 @@ static bool IsConfiguredReplacementForegroundProcess(
     return ProcessNameMatchesAny(processName, names);
 }
 
+static bool SleepUnlessUnloading(DWORD totalMs,
+                                 DWORD granularityMs = 25) {
+    if (totalMs == 0) {
+        return !IsUnloading();
+    }
+
+    ULONGLONG deadline = GetTickCount64() + totalMs;
+    while (!IsUnloading()) {
+        ULONGLONG now = GetTickCount64();
+        if (now >= deadline) {
+            return true;
+        }
+
+        DWORD sleepMs = static_cast<DWORD>(
+            std::min<ULONGLONG>(granularityMs, deadline - now));
+        Sleep(sleepMs);
+    }
+
+    return false;
+}
+
 static bool WaitForReplacementForeground(DWORD timeoutMs,
                                          const SettingsSnapshot& settings) {
     ULONGLONG deadline = GetTickCount64() + timeoutMs;
     while (GetTickCount64() < deadline) {
+        if (IsUnloading()) {
+            return false;
+        }
+
         ForegroundSnapshot current = CaptureForegroundSnapshot();
         if (IsConfiguredReplacementForegroundProcess(current.processName,
                                                      settings)) {
             return true;
         }
 
-        Sleep(25);
+        if (!SleepUnlessUnloading(25)) {
+            return false;
+        }
     }
 
     return false;
@@ -2160,7 +2327,15 @@ static bool ActivateConfiguredReplacementWindow(
 }
 
 static bool OpenReplacementWindow(const SettingsSnapshot& settings) {
+    if (IsUnloading()) {
+        return false;
+    }
+
     DismissWindowsSearchSurfaceIfForeground();
+
+    if (IsUnloading()) {
+        return false;
+    }
 
     if (settings.launcherTarget == LauncherTarget::CommandPalette) {
         if (ShellExecuteUri(L"x-cmdpal:") &&
@@ -2185,13 +2360,14 @@ static bool OpenReplacementWindow(const SettingsSnapshot& settings) {
         log_if(L"Custom command did not reach foreground");
     }
 
-    if (ActivateConfiguredReplacementWindow(settings) &&
+    if (!IsUnloading() && ActivateConfiguredReplacementWindow(settings) &&
         WaitForReplacementForeground(700, settings)) {
         return true;
     }
 
-    if (settings.launcherTarget != LauncherTarget::CommandPalette ||
-        !TrimString(settings.customHotkey).empty()) {
+    if (!IsUnloading() &&
+        (settings.launcherTarget != LauncherTarget::CommandPalette ||
+         !TrimString(settings.customHotkey).empty())) {
         SendLauncherHotkey(settings);
         if (WaitForReplacementForeground(1500, settings)) {
             return true;
@@ -2213,13 +2389,20 @@ static bool IsCaptureIdle(DWORD transitionIdleMs) {
            (GetTickCount64() - lastInputTick) >= transitionIdleMs;
 }
 
+static void SignalNoLaunchThreadsIfNeeded(LONG remaining) {
+    AcquireSRWLockShared(&g_launchTrackingLock);
+    HANDLE event = g_noLaunchThreadsEvent;
+    if (remaining == 0 && event) {
+        SetEvent(event);
+    }
+    ReleaseSRWLockShared(&g_launchTrackingLock);
+}
+
 class LaunchThreadLifetime {
    public:
     ~LaunchThreadLifetime() {
-        if (InterlockedDecrement(&g_activeLaunchThreads) == 0 &&
-            g_noLaunchThreadsEvent) {
-            SetEvent(g_noLaunchThreadsEvent);
-        }
+        SignalNoLaunchThreadsIfNeeded(
+            InterlockedDecrement(&g_activeLaunchThreads));
     }
 };
 
@@ -2254,21 +2437,29 @@ static bool RegisterLaunchThreadIfAllowed() {
 }
 
 static void UnregisterFailedLaunchThreadStart() {
-    if (InterlockedDecrement(&g_activeLaunchThreads) == 0 &&
-        g_noLaunchThreadsEvent) {
-        SetEvent(g_noLaunchThreadsEvent);
-    }
+    SignalNoLaunchThreadsIfNeeded(
+        InterlockedDecrement(&g_activeLaunchThreads));
 }
 
 static void WaitForLaunchThreadsAndCloseTracking() {
-    if (g_noLaunchThreadsEvent) {
-        WaitForSingleObject(g_noLaunchThreadsEvent, 5000);
+    HANDLE event = nullptr;
 
-        AcquireSRWLockExclusive(&g_launchTrackingLock);
+    AcquireSRWLockShared(&g_launchTrackingLock);
+    event = g_noLaunchThreadsEvent;
+    ReleaseSRWLockShared(&g_launchTrackingLock);
+
+    if (!event) {
+        return;
+    }
+
+    WaitForSingleObject(event, INFINITE);
+
+    AcquireSRWLockExclusive(&g_launchTrackingLock);
+    if (g_noLaunchThreadsEvent) {
         CloseHandle(g_noLaunchThreadsEvent);
         g_noLaunchThreadsEvent = nullptr;
-        ReleaseSRWLockExclusive(&g_launchTrackingLock);
     }
+    ReleaseSRWLockExclusive(&g_launchTrackingLock);
 }
 
 static DWORD WINAPI LaunchThreadProc(LPVOID) {
@@ -2276,7 +2467,7 @@ static DWORD WINAPI LaunchThreadProc(LPVOID) {
     SettingsSnapshot settings = GetSettingsSnapshot();
     PCWSTR launcherName = GetLauncherDebugName(settings.launcherTarget);
 
-    if (!OpenReplacementWindow(settings)) {
+    if (IsUnloading() || !OpenReplacementWindow(settings)) {
         Wh_Log(L"[ReplaceSearch] Failed to activate %s", launcherName);
         ClearPendingText();
         StopInputCaptureWindow();
@@ -2284,12 +2475,21 @@ static DWORD WINAPI LaunchThreadProc(LPVOID) {
         return 0;
     }
 
-    if (settings.textCaptureDelayMs > 0) {
-        Sleep(settings.textCaptureDelayMs);
+    if (settings.textCaptureDelayMs > 0 &&
+        !SleepUnlessUnloading(settings.textCaptureDelayMs)) {
+        ClearPendingText();
+        StopInputCaptureWindow();
+        EndLaunch();
+        return 0;
     }
 
     ULONGLONG hardDeadline = GetTickCount64() + 10000;
     for (;;) {
+        if (IsUnloading()) {
+            ClearPendingText();
+            break;
+        }
+
         ForegroundSnapshot current = CaptureForegroundSnapshot();
         if (!IsConfiguredReplacementForegroundProcess(current.processName,
                                                       settings)) {
@@ -2307,19 +2507,24 @@ static DWORD WINAPI LaunchThreadProc(LPVOID) {
         PendingTextBatch batch = ConsumePendingTextBatch();
         if (!batch.text.empty()) {
             SendPendingTextBatch(batch, settings.launcherTarget);
-            Sleep(15);
+            if (!SleepUnlessUnloading(15)) {
+                ClearPendingText();
+                break;
+            }
             continue;
         }
 
         if (!IsInputCaptureActive() || IsCaptureIdle(settings.transitionIdleMs) ||
             GetTickCount64() >= hardDeadline) {
             break;
-        } else {
-            Sleep(15);
+        } else if (!SleepUnlessUnloading(15)) {
+            ClearPendingText();
+            break;
         }
     }
 
-    PendingTextBatch finalBatch = ConsumePendingTextBatch();
+    PendingTextBatch finalBatch = IsUnloading() ? PendingTextBatch{}
+                                                : ConsumePendingTextBatch();
     if (!finalBatch.text.empty()) {
         ForegroundSnapshot current = CaptureForegroundSnapshot();
         if (IsConfiguredReplacementForegroundProcess(current.processName,
@@ -2505,7 +2710,9 @@ static bool IsStartSearchBoxPointerEvent(void* senderAbi,
 static bool HandleStartSearchBoxPointerEvent(void* senderAbi,
                                              void* argsAbi,
                                              PCWSTR hookName) {
-    if (!argsAbi) {
+    if (!IsRedirectCategoryEnabled(
+            RedirectCategory::StartMenuSearchBoxClick) ||
+        !argsAbi) {
         return false;
     }
 
@@ -2543,7 +2750,9 @@ static bool HandleStartSearchBoxPointerEvent(void* senderAbi,
 static bool HandleStartSearchBoxTappedEvent(void* senderAbi,
                                             void* argsAbi,
                                             PCWSTR hookName) {
-    if (!argsAbi) {
+    if (!IsRedirectCategoryEnabled(
+            RedirectCategory::StartMenuSearchBoxClick) ||
+        !argsAbi) {
         return false;
     }
 
@@ -2605,7 +2814,9 @@ using OpenSearchView_t = void(WINAPI*)(void* pThis);
 static OpenSearchView_t OpenSearchView_Original;
 
 static void WINAPI OpenSearchView_Hook(void* pThis) {
-    if (!RequestReplacement(L"StartDocked::LauncherFrame::OpenSearchView")) {
+    if (!RequestReplacementIfCategoryEnabled(
+            RedirectCategory::StartMenuSearchTransitions,
+            L"StartDocked::LauncherFrame::OpenSearchView")) {
         OpenSearchView_Original(pThis);
     }
 }
@@ -2618,7 +2829,9 @@ static long WINAPI StartSearchRequestExecute_Hook(void* pThis,
                                                   void* presenter) {
     (void)pThis;
     (void)presenter;
-    if (!RequestReplacement(L"StartDocked::StartSearchRequest::Execute")) {
+    if (!RequestReplacementIfCategoryEnabled(
+            RedirectCategory::StartMenuSearchTransitions,
+            L"StartDocked::StartSearchRequest::Execute")) {
         return StartSearchRequestExecute_Original(pThis, presenter);
     }
     return S_OK;
@@ -2631,20 +2844,25 @@ static StartDockedNoArgHook_t NavigationPaneMoveFocusToSearch_Original;
 
 static void WINAPI UpdateSearchBoxOffsetAndRequestMoveFocusToSearch_Hook(
     void* pThis) {
-    if (!RequestReplacement(
+    if (!RequestReplacementIfCategoryEnabled(
+            RedirectCategory::StartMenuSearchTransitions,
             L"StartDocked::LauncherFrame::UpdateSearchBoxOffsetAndRequestMoveFocusToSearch")) {
         UpdateSearchBoxOffsetAndRequestMoveFocusToSearch_Original(pThis);
     }
 }
 
 static void WINAPI LauncherFrameMoveFocusToSearch_Hook(void* pThis) {
-    if (!RequestReplacement(L"StartDocked::LauncherFrame::MoveFocusToSearch")) {
+    if (!RequestReplacementIfCategoryEnabled(
+            RedirectCategory::StartMenuSearchTransitions,
+            L"StartDocked::LauncherFrame::MoveFocusToSearch")) {
         LauncherFrameMoveFocusToSearch_Original(pThis);
     }
 }
 
 static void WINAPI NavigationPaneMoveFocusToSearch_Hook(void* pThis) {
-    if (!RequestReplacement(L"StartDocked::NavigationPaneView::MoveFocusToSearch")) {
+    if (!RequestReplacementIfCategoryEnabled(
+            RedirectCategory::StartMenuSearchTransitions,
+            L"StartDocked::NavigationPaneView::MoveFocusToSearch")) {
         NavigationPaneMoveFocusToSearch_Original(pThis);
     }
 }
@@ -2658,7 +2876,8 @@ using StartDockedObjectEventHook_t = void(WINAPI*)(void* pThis, void* sender,
 static StartDockedObjectEventHook_t OnFakeSearchBoxClicked_Original;
 
 static void WINAPI OnTryToMoveFocusToSearchEvent_Hook(void* pThis, void* payload) {
-    if (!RequestReplacement(
+    if (!RequestReplacementIfCategoryEnabled(
+            RedirectCategory::StartMenuSearchTransitions,
             L"StartDocked::LauncherFrame::OnTryToMoveFocusToSearchEvent")) {
         OnTryToMoveFocusToSearchEvent_Original(pThis, payload);
     }
@@ -2666,7 +2885,8 @@ static void WINAPI OnTryToMoveFocusToSearchEvent_Hook(void* pThis, void* payload
 
 static void WINAPI OnShellHandwritingTryToOpenSearchViewEvent_Hook(void* pThis,
                                                                    void* payload) {
-    if (!RequestReplacement(
+    if (!RequestReplacementIfCategoryEnabled(
+            RedirectCategory::StartMenuSearchTransitions,
             L"StartDocked::LauncherFrame::OnShellHandwritingTryToOpenSearchViewEvent")) {
         OnShellHandwritingTryToOpenSearchViewEvent_Original(pThis, payload);
     }
@@ -2674,7 +2894,9 @@ static void WINAPI OnShellHandwritingTryToOpenSearchViewEvent_Hook(void* pThis,
 
 static void WINAPI OnFakeSearchBoxClicked_Hook(void* pThis, void* sender,
                                                void* args) {
-    if (!RequestReplacement(L"StartDocked::LauncherFrame::OnFakeSearchBoxClicked")) {
+    if (!RequestReplacementIfCategoryEnabled(
+            RedirectCategory::StartMenuSearchBoxClick,
+            L"StartDocked::LauncherFrame::OnFakeSearchBoxClicked")) {
         OnFakeSearchBoxClicked_Original(pThis, sender, args);
     }
 }
@@ -2783,8 +3005,14 @@ using SearchBoxSetObject_t = long(WINAPI*)(void* pThis, void* value);
 using SearchBoxGetObject_t = long(WINAPI*)(void* pThis, void** value);
 static SearchBoxSetObject_t SearchBoxSetIsChecked_Original;
 static SearchBoxGetObject_t SearchBoxGetCommand_Original;
+constexpr bool kEnableRiskyStartCommandHook = true;
 
 static long WINAPI SearchBoxSetIsChecked_Hook(void* pThis, void* value) {
+    if (!IsRedirectCategoryEnabled(
+            RedirectCategory::StartMenuSearchBoxClick)) {
+        return SearchBoxSetIsChecked_Original(pThis, value);
+    }
+
     bool activationLikely = IsStartSearchBoxPointerActivationLikely();
     log_if(L"StartDocked::SearchBoxToggleButton::set_IsChecked activation=%d",
            activationLikely ? 1 : 0);
@@ -2805,6 +3033,12 @@ static long WINAPI SearchBoxSetIsChecked_Hook(void* pThis, void* value) {
 // heuristic to limit blast radius, but should be re-evaluated if the
 // pointer/tap hooks cover all real-world paths.
 static long WINAPI SearchBoxGetCommand_Hook(void* pThis, void** value) {
+    if (!kEnableRiskyStartCommandHook ||
+        !IsRedirectCategoryEnabled(
+            RedirectCategory::StartMenuSearchBoxClick)) {
+        return SearchBoxGetCommand_Original(pThis, value);
+    }
+
     bool activationLikely = IsStartSearchBoxPointerActivationLikely();
     if (activationLikely) {
         log_if(L"StartDocked::SearchBoxToggleButton::get_Command blocked during activation");
@@ -2827,7 +3061,9 @@ static OnTaskbarSearchTapped_t OnTaskbarSearchTapped_Original;
 
 static void WINAPI OnTaskbarSearchTapped_Hook(void* pThis, void* sender,
                                               void* args) {
-    if (!RequestReplacement(L"TaskbarSearchPageViewModel::OnTaskbarSearchTapped")) {
+    if (!RequestReplacementIfCategoryEnabled(
+            RedirectCategory::TaskbarSearch,
+            L"TaskbarSearchPageViewModel::OnTaskbarSearchTapped")) {
         OnTaskbarSearchTapped_Original(pThis, sender, args);
     }
 }
@@ -2838,7 +3074,9 @@ static LaunchToSearch_t LaunchToSearch_Original;
 
 static void WINAPI LaunchToSearch_Hook(void* pThis, void* appShownEventArgs,
                                        void* initialQuery) {
-    if (!RequestReplacement(L"TaskbarSearchPageViewModel::LaunchToSearch")) {
+    if (!RequestReplacementIfCategoryEnabled(
+            RedirectCategory::TaskbarSearch,
+            L"TaskbarSearchPageViewModel::LaunchToSearch")) {
         LaunchToSearch_Original(pThis, appShownEventArgs, initialQuery);
     }
 }
@@ -2848,7 +3086,8 @@ static NotifyNavigationToFindInStartRequested_t
     NotifyNavigationToFindInStartRequested_Original;
 
 static void WINAPI NotifyNavigationToFindInStartRequested_Hook(void* pThis) {
-    if (!RequestReplacement(
+    if (!RequestReplacementIfCategoryEnabled(
+            RedirectCategory::TaskbarSearch,
             L"TaskbarSearchPageViewModel::NotifyNavigationToFindInStartRequested")) {
         NotifyNavigationToFindInStartRequested_Original(pThis);
     }
@@ -2859,14 +3098,18 @@ static SearchButtonOnTapped_t SearchButtonControlOnTapped_Original;
 static SearchButtonOnTapped_t SearchV2ButtonOnTapped_Original;
 
 static long WINAPI SearchButtonControlOnTapped_Hook(void* pThis, void* args) {
-    if (!RequestReplacement(L"SearchButtonControl::OnTapped")) {
+    if (!RequestReplacementIfCategoryEnabled(
+            RedirectCategory::TaskbarSearch,
+            L"SearchButtonControl::OnTapped")) {
         return SearchButtonControlOnTapped_Original(pThis, args);
     }
     return S_OK;
 }
 
 static long WINAPI SearchV2ButtonOnTapped_Hook(void* pThis, void* args) {
-    if (!RequestReplacement(L"SearchV2Button::OnTapped")) {
+    if (!RequestReplacementIfCategoryEnabled(
+            RedirectCategory::TaskbarSearch,
+            L"SearchV2Button::OnTapped")) {
         return SearchV2ButtonOnTapped_Original(pThis, args);
     }
     return S_OK;
@@ -2883,6 +3126,10 @@ using UndockedShowWithStart_t = long(WINAPI*)(void* pThis,
 static UndockedShowWithStart_t UndockedShowWithStart_Original;
 
 static bool HandleUndockedSearchActivation(PCWSTR hookName) {
+    if (!IsRedirectCategoryEnabled(RedirectCategory::UndockedSearch)) {
+        return false;
+    }
+
     if (IsUndockedSearchIgnored()) {
         log_if(L"%s suppressed as Start/taskbar-open side effect", hookName);
         return true;
@@ -3004,6 +3251,10 @@ static std::wstring ExtractSearchProtocolQuery(PCWSTR file) {
 
 static BOOL WINAPI ShellExecuteExW_Hook(SHELLEXECUTEINFOW* execInfo) {
     if (execInfo && IsSearchProtocol(execInfo->lpFile)) {
+        if (!IsRedirectCategoryEnabled(RedirectCategory::SearchProtocol)) {
+            return ShellExecuteExW_Original(execInfo);
+        }
+
         log_if(L"Search protocol intercepted");
         if (!CanRedirectSearch(L"Search protocol")) {
             return ShellExecuteExW_Original(execInfo);
@@ -3160,10 +3411,20 @@ static bool HookStartDockedSymbols() {
         StartSearchRequestExecute_Original ||
         UpdateSearchBoxOffsetAndRequestMoveFocusToSearch_Original ||
         LauncherFrameMoveFocusToSearch_Original ||
+        NavigationPaneMoveFocusToSearch_Original ||
+        OnTryToMoveFocusToSearchEvent_Original ||
+        OnShellHandwritingTryToOpenSearchViewEvent_Original ||
         OnFakeSearchBoxClicked_Original ||
+        LauncherFrameOnAllRoutedPointerPressedEvents_Original ||
+        NavigationPaneOnAllRoutedPointerPressedEvents_Original ||
+        SearchBoxOnPointerEntered_Original ||
+        SearchBoxOnPointerExited_Original ||
+        SearchBoxSetIsChecked_Original ||
+        SearchBoxGetCommand_Original ||
         LauncherFrameOnPointerPressed_Original ||
         LauncherFrameOnTapped_Original ||
-        SearchBoxSetIsChecked_Original;
+        StartSizingFrameOnPointerPressed_Original ||
+        StartSizingFrameOnTapped_Original;
     if (!anyInstalled) {
         Wh_Log(L"[ReplaceSearch] StartDocked.dll: no symbols were resolved");
     }
@@ -3410,7 +3671,7 @@ static void StopModuleWatcherThread() {
     }
 
     SetEvent(g_moduleWatcherStopEvent);
-    WaitForSingleObject(g_moduleWatcherThread, 5000);
+    WaitForSingleObject(g_moduleWatcherThread, INFINITE);
     CloseHandle(g_moduleWatcherThread);
     g_moduleWatcherThread = nullptr;
 
@@ -3435,6 +3696,8 @@ static void HookSearchProtocolFallback() {
 // -------------------- Windhawk entry points --------------------
 
 BOOL Wh_ModInit() {
+    InterlockedExchange(&g_unloading, 0);
+
     g_targetProcess = DetectTargetProcess();
     LoadSettings();
     if (!InitLaunchThreadTracking()) {
@@ -3501,4 +3764,3 @@ void Wh_ModUninit() {
 void Wh_ModSettingsChanged() {
     LoadSettings();
 }
-
