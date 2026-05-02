@@ -1,4 +1,4 @@
-# Windhawk Search Replacement
+# Windows Search Redirector
 
 > English version · [Version française](README.fr.md)
 
