@@ -4,6 +4,7 @@
 // @description     Redirects Windows Search to Command Palette, PowerToys Run, or a custom launcher and forwards initial text
 // @version         1.0.0
 // @author          Fefedu973
+// @github          https://github.com/Fefedu973
 // @include         explorer.exe
 // @include         StartMenuExperienceHost.exe
 // @include         SearchHost.exe
