@@ -98,6 +98,30 @@ sequenceDiagram
     L->>S: StopInputCaptureWindow()
 ```
 
+## Détection Win+C
+
+La redirection de `Win+C` est conditionnelle: le mod vérifie d'abord si `Win+C` est actuellement configuré pour ouvrir Windows Search, puis décide de rediriger ou de laisser le comportement Windows natif.
+
+```mermaid
+flowchart TD
+    A["Win+C pressé"] --> B{"redirectWinC activé ?"}
+    B -- "Non" --> Z["Laisser Windows gérer Win+C"]
+    B -- "Oui" --> C{"autoDetectWinCSearchShortcut activé ?"}
+    C -- "Non" --> D["Intercepter Win+C"]
+    D --> E["Lancer le launcher de remplacement"]
+
+    C -- "Oui" --> F["Lire la clé policy :\nHKCU\\Software\\Policies\\Microsoft\\Windows\\CopilotKey\nSetCopilotHardwareKey"]
+    F --> G{"Valeur trouvée ?"}
+    G -- "Oui" --> H{"Valeur = 'Search' ?"}
+    H -- "Oui" --> D
+    H -- "Non" --> Z
+
+    G -- "Non" --> I["Lire la clé utilisateur :\nHKCU\\Software\\Microsoft\\Windows\\Shell\\BrandedKey\nBrandedKeyChoiceType"]
+    I --> J{"Valeur = 'Search' ?"}
+    J -- "Oui" --> D
+    J -- "Non / absente" --> Z
+```
+
 L'état partagé utilise:
 
 | Élément | Rôle |

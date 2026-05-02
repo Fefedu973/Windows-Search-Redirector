@@ -98,6 +98,30 @@ sequenceDiagram
     L->>S: StopInputCaptureWindow()
 ```
 
+## Win+C Detection
+
+Redirection of `Win+C` is conditional: the mod first checks whether `Win+C` is currently configured to open Windows Search, then decides whether to intercept it or leave the native Windows behavior intact.
+
+```mermaid
+flowchart TD
+    A["Win+C pressed"] --> B{"redirectWinC enabled?"}
+    B -- "No" --> Z["Let Windows handle Win+C"]
+    B -- "Yes" --> C{"autoDetectWinCSearchShortcut enabled?"}
+    C -- "No" --> D["Intercept Win+C"]
+    D --> E["Launch replacement launcher"]
+
+    C -- "Yes" --> F["Read policy registry key:\nHKCU\\Software\\Policies\\Microsoft\\Windows\\CopilotKey\nSetCopilotHardwareKey"]
+    F --> G{"Value found?"}
+    G -- "Yes" --> H{"Value = 'Search'?"}
+    H -- "Yes" --> D
+    H -- "No" --> Z
+
+    G -- "No" --> I["Read user registry key:\nHKCU\\Software\\Microsoft\\Windows\\Shell\\BrandedKey\nBrandedKeyChoiceType"]
+    I --> J{"Value = 'Search'?"}
+    J -- "Yes" --> D
+    J -- "No / missing" --> Z
+```
+
 The shared state uses:
 
 | Element | Role |
