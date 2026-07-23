@@ -171,6 +171,15 @@ static void SendWinS() {
     SendVirtualKey(VK_LWIN, true);
 }
 
+static void SendCtrlEsc() {
+    ReleaseModifiers();
+    SendVirtualKey(VK_CONTROL, false);
+    Sleep(40);
+    TapVirtualKey(VK_ESCAPE);
+    Sleep(40);
+    SendVirtualKey(VK_CONTROL, true);
+}
+
 static void SendCtrlV() {
     ReleaseModifiers();
     SendVirtualKey(VK_CONTROL, false);
@@ -273,6 +282,52 @@ static void ClickPoint(int x, int y) {
     SendInput(2, inputs, sizeof(INPUT));
 }
 
+static HWND FindTaskbarStartButton() {
+    HWND taskbar = FindWindowW(L"Shell_TrayWnd", nullptr);
+    if (!taskbar) {
+        return nullptr;
+    }
+
+    HWND found = nullptr;
+    EnumChildWindows(
+        taskbar,
+        [](HWND hwnd, LPARAM lParam) -> BOOL {
+            wchar_t className[256] = {};
+            if (GetClassNameW(hwnd, className, ARRAYSIZE(className)) &&
+                _wcsicmp(className, L"Start") == 0) {
+                *reinterpret_cast<HWND*>(lParam) = hwnd;
+                return FALSE;
+            }
+
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&found));
+
+    return found;
+}
+
+static void ClickTaskbarStartButton() {
+    ReleaseModifiers();
+
+    HWND startButton = FindTaskbarStartButton();
+    if (!startButton) {
+        std::wprintf(L"taskbar start button not found\n");
+        return;
+    }
+
+    RECT rect = {};
+    if (!GetWindowRect(startButton, &rect)) {
+        std::wprintf(L"taskbar start button rect unavailable\n");
+        return;
+    }
+
+    int x = rect.left + (rect.right - rect.left) / 2;
+    int y = rect.top + (rect.bottom - rect.top) / 2;
+    std::wprintf(L"clicking taskbar start button x=%d y=%d\n", x, y);
+    ClickPoint(x, y);
+    Sleep(800);
+}
+
 static void ClickStartSearchBox() {
     OpenStartMenu();
 
@@ -299,7 +354,7 @@ static void ClickStartSearchBox() {
 }
 
 static void PrintUsage() {
-    std::puts("usage: wh-test-input <fg|uia|enumtaskbar|esc|cmdpal|wins|start|startclicksearch|starttype TEXT|startpaste TEXT|type TEXT|protocolsearch TEXT>");
+    std::puts("usage: wh-test-input <fg|uia|enumtaskbar|esc|cmdpal|wins|ctrlesc|start|startbutton|startclicksearch|starttype TEXT|startpaste TEXT|type TEXT|protocolsearch TEXT>");
 }
 
 int wmain(int argc, wchar_t** argv) {
@@ -349,8 +404,21 @@ int wmain(int argc, wchar_t** argv) {
         return 0;
     }
 
+    if (command == L"ctrlesc") {
+        SendCtrlEsc();
+        Sleep(800);
+        PrintForeground();
+        return 0;
+    }
+
     if (command == L"start") {
         OpenStartMenu();
+        PrintForeground();
+        return 0;
+    }
+
+    if (command == L"startbutton") {
+        ClickTaskbarStartButton();
         PrintForeground();
         return 0;
     }

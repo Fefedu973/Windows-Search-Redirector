@@ -4,7 +4,16 @@
 
 This project is a self-contained Windhawk mod that replaces the Windows Search entry points with an external launcher. The default target is PowerToys Command Palette via `x-cmdpal:`. The mod also captures text typed or pasted during the transition so characters are never lost or sent to the wrong window.
 
-The legacy folder `C:\Users\ferre\WindhawkToolchain` is now treated as a read-only archive. Changes must happen in this repository.
+Current mod version: **1.0.2**.
+
+## Installation
+
+1. Install [Windhawk](https://windhawk.net/).
+2. Create a new local mod in Windhawk.
+3. Replace its source with [`src/replace-windows-search.wh.cpp`](src/replace-windows-search.wh.cpp).
+4. Compile the mod, review the settings, and enable it.
+
+The default configuration targets PowerToys Command Palette. PowerToys Run, a custom hotkey, and a custom command or URI are also supported.
 
 ## Layout
 
@@ -16,8 +25,6 @@ The legacy folder `C:\Users\ferre\WindhawkToolchain` is now treated as a read-on
 | `tools/bin/dbwin-listener.exe` | Local binary of the log listener. |
 | `tests/wh-test-input.cpp` | Test harness used to simulate Start/Search input. |
 | `tests/bin/wh-test-input.exe` | Local binary of the test harness. |
-| `docs/windhawk-doc.md` | Local export of the Windhawk documentation referenced during development. |
-| `docs/external-review.md` | External review kept as maintenance context. |
 
 ## Overview
 
@@ -67,6 +74,7 @@ The mod is injected into three processes:
 | Typing in the open Start menu | `WH_KEYBOARD_LL` while Start/Search is foreground | Transactional capture window | Characters are buffered until the launcher is ready. |
 | `Ctrl+V` in Start/Search | `WH_KEYBOARD_LL` + bounded clipboard read | Unicode injection when the clipboard was normalized | The native Windows Search paste is blocked. |
 | Click on the Start search bar | XAML hooks in `StartDocked.dll` | `WH_MOUSE_LL` + semantic UI Automation | The click is swallowed if the launcher is available. |
+| Open Start with its taskbar button or `Ctrl+Esc` | Low-level mouse/keyboard hooks | Short suppression window | Search side effects caused by opening Start are ignored without blocking the Start menu itself. |
 | Taskbar Search | `SearchUx.UI.dll` | `twinui.pcshell.dll` depending on the Windows path | The native Search activation is canceled. |
 | `ms-search:` / `search-ms:` protocols | `ShellExecuteExW` in explorer | No hook outside the injected processes | The query is extracted and the caller receives a synthesized success. |
 
@@ -241,7 +249,17 @@ Quick tests:
 .\tests\bin\wh-test-input.exe startpaste "text from clipboard"
 .\tests\bin\wh-test-input.exe startclicksearch
 .\tests\bin\wh-test-input.exe wins
+.\tests\bin\wh-test-input.exe ctrlesc
+.\tests\bin\wh-test-input.exe startbutton
 ```
+
+## Changelog
+
+### 1.0.2
+
+- Ignore transient Search activations caused by opening Start from the taskbar.
+- Apply the same protection to `Ctrl+Esc`.
+- Extend the input harness with `ctrlesc` and `startbutton` regression checks.
 
 ## Maintenance
 

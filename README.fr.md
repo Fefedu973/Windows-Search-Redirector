@@ -4,7 +4,16 @@
 
 Ce projet contient un mod Windhawk autonome qui remplace les points d'entrée de Windows Search par un launcher externe. La cible par défaut est PowerToys Command Palette via `x-cmdpal:`. Le mod capture aussi le texte tapé/collé pendant la transition afin d'éviter les caractères perdus ou envoyés dans la mauvaise fenêtre.
 
-Le dossier historique `C:\Users\ferre\WindhawkToolchain` est désormais traité comme une archive en lecture seule. Les modifications doivent être faites dans ce dépôt.
+Version actuelle du mod : **1.0.2**.
+
+## Installation
+
+1. Installer [Windhawk](https://windhawk.net/).
+2. Créer un nouveau mod local dans Windhawk.
+3. Remplacer sa source par [`src/replace-windows-search.wh.cpp`](src/replace-windows-search.wh.cpp).
+4. Compiler le mod, vérifier ses paramètres, puis l'activer.
+
+La configuration par défaut cible PowerToys Command Palette. PowerToys Run, un raccourci personnalisé et une commande ou URI personnalisée sont également pris en charge.
 
 ## Arborescence
 
@@ -16,8 +25,6 @@ Le dossier historique `C:\Users\ferre\WindhawkToolchain` est désormais traité 
 | `tools/bin/dbwin-listener.exe` | Binaire local du listener de logs. |
 | `tests/wh-test-input.cpp` | Harnais de test pour simuler les entrées Start/Search. |
 | `tests/bin/wh-test-input.exe` | Binaire local du harnais de test. |
-| `docs/windhawk-doc.md` | Export local de la documentation Windhawk utilisée pendant le développement. |
-| `docs/external-review.md` | Review externe reçue, conservée comme contexte de maintenance. |
 
 ## Vue D'ensemble
 
@@ -67,6 +74,7 @@ Le mod est injecté dans trois processus:
 | Taper dans le menu Démarrer ouvert | `WH_KEYBOARD_LL` si Start/Search est foreground | Fenêtre de capture transactionnelle | Les caractères sont bufferisés jusqu'à ce que le launcher soit prêt. |
 | `Ctrl+V` dans Start/Search | `WH_KEYBOARD_LL` + lecture clipboard bornée | Injection Unicode si le clipboard a été normalisé | Le paste natif Windows Search est bloqué. |
 | Clic barre de recherche Start | Hooks XAML `StartDocked.dll` | `WH_MOUSE_LL` + UI Automation sémantique | Le clic est swallow si le launcher est disponible. |
+| Ouverture de Démarrer par son bouton ou `Ctrl+Esc` | Hooks souris/clavier bas niveau | Courte fenêtre de suppression | Les effets Search transitoires sont ignorés sans bloquer le menu Démarrer. |
 | Search taskbar | `SearchUx.UI.dll` | `twinui.pcshell.dll` selon le chemin Windows | L'ouverture native de Search est annulée. |
 | Protocoles `ms-search:` / `search-ms:` | `ShellExecuteExW` dans explorer | Aucun hook global hors processus injectés | La requête est extraite puis le caller reçoit un succès simulé. |
 
@@ -241,7 +249,17 @@ Tests rapides:
 .\tests\bin\wh-test-input.exe startpaste "texte depuis clipboard"
 .\tests\bin\wh-test-input.exe startclicksearch
 .\tests\bin\wh-test-input.exe wins
+.\tests\bin\wh-test-input.exe ctrlesc
+.\tests\bin\wh-test-input.exe startbutton
 ```
+
+## Historique
+
+### 1.0.2
+
+- Ignore les activations Search transitoires causées par l'ouverture de Démarrer depuis la barre des tâches.
+- Applique la même protection à `Ctrl+Esc`.
+- Ajoute les scénarios de régression `ctrlesc` et `startbutton` au harnais de test.
 
 ## Maintenance
 
