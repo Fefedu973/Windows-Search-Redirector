@@ -2,7 +2,7 @@
 // @id              replace-windows-search-with-app
 // @name            Windows Search Redirector
 // @description     Redirects Windows Search to Command Palette, PowerToys Run, or a custom launcher and forwards initial text
-// @version         1.0.1
+// @version         1.0.2
 // @author          Fefedu973
 // @github          https://github.com/Fefedu973
 // @include         explorer.exe
@@ -841,6 +841,8 @@ enum class RedirectCategory {
     SearchProtocol,
 };
 
+static bool IsUndockedSearchIgnored();
+
 static bool IsFlagEnabled(volatile LONG* flag) {
     return InterlockedCompareExchange(flag, 0, 0) != 0;
 }
@@ -937,7 +939,20 @@ static bool IsRedirectCategoryEnabled(RedirectCategory category) {
 
 static bool RequestReplacementIfCategoryEnabled(RedirectCategory category,
                                                 PCWSTR reason) {
-    return IsRedirectCategoryEnabled(category) && RequestReplacement(reason);
+    if (!IsRedirectCategoryEnabled(category)) {
+        return false;
+    }
+
+    if (IsUndockedSearchIgnored() &&
+        (category == RedirectCategory::StartMenuSearchTransitions ||
+         category == RedirectCategory::TaskbarSearch ||
+         category == RedirectCategory::UndockedSearch)) {
+        log_if(L"%s suppressed as Start-open side effect",
+               reason ? reason : L"Search request");
+        return true;
+    }
+
+    return RequestReplacement(reason);
 }
 
 static std::wstring GetProcessNameFromPid(DWORD pid) {
@@ -1337,6 +1352,62 @@ static bool IsStartMenuWindowAtPoint(POINT pt) {
     return _wcsicmp(processName.c_str(), L"StartMenuExperienceHost.exe") == 0;
 }
 
+static bool PointInWindowRect(HWND hwnd, POINT pt) {
+    RECT rect = {};
+    return GetWindowRect(hwnd, &rect) && PtInRect(&rect, pt);
+}
+
+static bool IsTaskbarWindowClass(HWND hwnd) {
+    wchar_t className[256] = {};
+    if (!GetClassNameW(hwnd, className, _countof(className))) {
+        return false;
+    }
+
+    return _wcsicmp(className, L"Shell_TrayWnd") == 0 ||
+           _wcsicmp(className, L"Shell_SecondaryTrayWnd") == 0;
+}
+
+static bool IsTaskbarStartButtonWindow(HWND hwnd) {
+    wchar_t className[256] = {};
+    return GetClassNameW(hwnd, className, _countof(className)) &&
+           _wcsicmp(className, L"Start") == 0;
+}
+
+static bool IsTaskbarStartButtonAtPoint(POINT pt) {
+    struct Context {
+        POINT pt;
+        bool matched;
+    } context = {pt, false};
+
+    EnumWindows(
+        [](HWND hwnd, LPARAM lParam) -> BOOL {
+            auto* context = reinterpret_cast<Context*>(lParam);
+            if (!IsTaskbarWindowClass(hwnd) ||
+                !PointInWindowRect(hwnd, context->pt)) {
+                return TRUE;
+            }
+
+            EnumChildWindows(
+                hwnd,
+                [](HWND child, LPARAM childParam) -> BOOL {
+                    auto* context = reinterpret_cast<Context*>(childParam);
+                    if (IsTaskbarStartButtonWindow(child) &&
+                        PointInWindowRect(child, context->pt)) {
+                        context->matched = true;
+                        return FALSE;
+                    }
+
+                    return TRUE;
+                },
+                reinterpret_cast<LPARAM>(context));
+
+            return context->matched ? FALSE : TRUE;
+        },
+        reinterpret_cast<LPARAM>(&context));
+
+    return context.matched;
+}
+
 static bool UiaStringContainsAny(BSTR value) {
     if (!value) {
         return false;
@@ -1435,6 +1506,13 @@ static LRESULT CALLBACK LowLevelMouseProc(int nCode,
                                           LPARAM lParam) {
     if (nCode == HC_ACTION && wParam == WM_LBUTTONDOWN && lParam) {
         const auto* mouseInfo = reinterpret_cast<const MSLLHOOKSTRUCT*>(lParam);
+        if (IsTaskbarStartButtonAtPoint(mouseInfo->pt)) {
+            IgnoreUndockedSearchFor();
+            log_if(L"Taskbar Start button click detected; suppressing "
+                   L"Start-open side effects");
+            return CallNextHookEx(g_mouseHook, nCode, wParam, lParam);
+        }
+
         if (IsRedirectCategoryEnabled(
                 RedirectCategory::StartMenuSearchBoxClick) &&
             IsStartSearchBoxAtPoint(mouseInfo->pt) &&
@@ -1480,6 +1558,13 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
         const bool ctrlDown = IsVirtualKeyDown(VK_CONTROL);
         const bool altDown = IsVirtualKeyDown(VK_MENU);
         const bool shiftDown = IsVirtualKeyDown(VK_SHIFT);
+
+        if (keyboardInfo->vkCode == VK_ESCAPE && ctrlDown && !altDown &&
+            !shiftDown && !leftWinDown && !rightWinDown) {
+            IgnoreUndockedSearchFor();
+            log_if(L"Ctrl+Esc detected; suppressing Start-open side effects");
+            return CallNextHookEx(g_keyboardHook, nCode, wParam, lParam);
+        }
 
         if ((keyboardInfo->vkCode == VK_LWIN ||
              keyboardInfo->vkCode == VK_RWIN) &&
