@@ -4,7 +4,9 @@
 
 This project is a self-contained Windhawk mod that replaces the Windows Search entry points with an external launcher. The default target is PowerToys Command Palette via `x-cmdpal:`. The mod buffers text typed or pasted during activation and checks the destination before replaying it. See the limitations below: activation failure is not a lossless recovery path.
 
-Current pre-release: [**1.0.3-dev**](https://github.com/Fefedu973/Windows-Search-Redirector/releases/tag/v1.0.3-dev). See the [release notes](docs/releases/1.0.3-dev.md) for changes and verification limits.
+Current pre-release: [**1.0.4-dev**](https://github.com/Fefedu973/Windows-Search-Redirector/releases/tag/v1.0.4-dev). See the [release notes](docs/releases/1.0.4-dev.md) for changes and verification limits.
+
+This version adds native animation-free Start dismissal on supported builds and optional Command Palette placement. See the [investigation and runtime evidence](docs/presentation-investigation-2026-10-11.md).
 
 ## Installation
 
@@ -25,6 +27,9 @@ The default configuration targets PowerToys Command Palette. PowerToys Run, a cu
 | `tools/bin/dbwin-listener.exe` | Local binary of the log listener. |
 | `tests/wh-test-input.cpp` | Test harness used to simulate Start/Search input. |
 | `tests/bin/wh-test-input.exe` | Local binary of the test harness. |
+| `tests/runtime-regression.cpp` | Desktop regressions, semantic Start search click and actual palette position checks. |
+| `tests/palette-placement.cpp` | Standalone tests of the geometry used by the single-file mod. |
+| `tests/record-start-dismiss.ps1`, `tests/analyze-start-dismiss.py` | Record a transition, track the Start border using actual frame timestamps and generate a contact sheet. |
 
 ## Overview
 
@@ -63,7 +68,7 @@ The mod is injected into three processes:
 | Process | Responsibility |
 | --- | --- |
 | `explorer.exe` | Main coordination, global keyboard/mouse hooks, Search protocol hook, UIA fallback, `twinui.pcshell.dll` hooks when available. |
-| `StartMenuExperienceHost.exe` | `StartDocked.dll` hooks for Start UI to Search transitions. |
+| `StartMenuExperienceHost.exe` | `StartDocked.dll` hooks for Start UI to Search transitions; optional native dismissal factory in the newer `StartMenu.dll`. |
 | `SearchHost.exe` | `SearchUx.UI.dll` hooks for the taskbar/SearchHost paths. |
 
 ## Hook Matrix
@@ -192,9 +197,32 @@ Availability requires a matching launcher window and a successful bounded `WM_NU
 
 Foreground activation no longer attaches input queues, focuses a top-level HWND, flips topmost state, or sends Escape before launching. After a denied foreground request, a masked Alt sequence can unlock activation, but only with no Shift/Ctrl/Alt/Win held, to avoid triggering a keyboard-layout shortcut. A swallowed Win+S is masked before Windows-key release so it does not become a bare Win press.
 
-If the launcher disappears or becomes unresponsive before admission, the original hook runs normally. If activation fails **after** admission, the current buffered query is discarded rather than sent to an unrelated application; subsequent requests pass through for five seconds. This is not automatic restoration of the first query. Instant, animation-free Start dismissal is **not implemented** in this version.
+If the launcher disappears or becomes unresponsive before admission, the original hook runs normally. If activation fails **after** admission, the current buffered query is discarded rather than sent to an unrelated application; subsequent requests pass through for five seconds. This is not automatic restoration of the first query.
 
 In `Custom hotkey` mode, `customProcessName` is required to detect the foreground and forward text. In `Custom command` mode it is also required when the command is a URI or when the process name cannot be inferred from a `.exe`.
+
+## Start Dismissal And Placement
+
+On the newer Start menu, `StartMenu.dll` supplies both `AnimationProvider::CreateDismissAnimation()` and `CreateDismissNoAnimation()`. When `instantStartDismiss` is enabled and a shared launch transaction is active, the mod substitutes the second native factory for the first. Windows still owns deactivation, composition and completion callbacks. The mod does not forcibly hide the Start HWND, change system animation preferences or call a private Explorer presenter through an unverified object pointer. If either symbol is unavailable, ordinary dismissal is retained.
+
+```mermaid
+flowchart LR
+    A["Launcher takes foreground"] --> B["Windows dismisses Start"]
+    B --> C["CreateDismissAnimation hook in StartMenu.dll"]
+    C --> D{"Enabled + active redirect + native factory available?"}
+    D -->|Yes| E["CreateDismissNoAnimation"]
+    D -->|No| F["Original animated factory"]
+    E --> G["Windows completes its normal dismissal lifecycle"]
+    F --> G
+```
+
+This removes the closing slide, not the time needed to summon the launcher. A local control recording showed a roughly 200 ms slide; the enabled recording showed Start stationary in one frame and absent in the next, 17 ms later. This is evidence for the tested build, not a promise of sub-frame timing or support on every Windows version.
+
+Command Palette placement is opt-in. Choose any of the nine screen positions, custom percentages, or **Follow Start horizontally**. The latter reads the visible `SearchBoxToggleButton` bounds through UI Automation before activation, aligns the palette's center with that control, and retains its native vertical position within the work area. It does not use screen-coordinate guesses or the fullscreen Start host HWND. If Start is absent or its semantic control cannot be read, the palette is left alone.
+
+Fixed/custom presets can use the launcher, source-window, pointer or primary monitor. Placement respects the work area, taskbar and DPI-scaled margin; custom percentages describe the available travel of the whole window. The mod moves only the verified, visible foreground Command Palette window, without activation, resizing or z-order changes. It does not reposition an already-foreground palette, PowerToys Run, custom launchers, or manual Command Palette invocations. Default placement performs no extra UIA lookup or move. A cross-monitor DPI change allows a bounded correction, not continuous enforcement against user dragging.
+
+Late-loaded DLL hooks are applied from a watcher started in `Wh_ModAfterInit`. The watcher is joined in `Wh_ModBeforeUninit`, before Windhawk removes hooks. No hook operations are applied from `Wh_ModInit` or after the before-unload callback returns.
 
 ## Settings
 
@@ -206,6 +234,11 @@ In `Custom hotkey` mode, `customProcessName` is required to detect the foregroun
 | `customHotkey` | empty | Text | Optional hotkey, e.g. `win+alt+space`, `ctrl+space`, `alt+space`. |
 | `customCommand` | empty | Text | Custom executable, command or URI. |
 | `customCommandArgs` | empty | Text | Arguments for a custom executable. Ignored for URI commands. |
+| `commandPalettePosition` | `default` | Combobox | Default, Follow Start horizontally, nine grid positions, or custom percentages. Only when the mod opens Command Palette. |
+| `commandPaletteMonitor` | `launcher` | Combobox | PowerToys-selected monitor, source window, mouse pointer or primary monitor. Follow Start uses Start's monitor instead. |
+| `commandPaletteMargin` | `16` | Number | Work-area edge margin in DPI-scaled pixels, clamped to 0-200. |
+| `commandPaletteX` / `commandPaletteY` | `50` / `25` | Number | Custom mode: horizontal/vertical travel, clamped to 0-100 percent. |
+| `instantStartDismiss` | `true` | Toggle | Use StartMenu.dll's native no-animation factory during redirection when available. Ordinary Start use remains unchanged outside a transaction. |
 | `textCaptureDelayMs` | `0` | Number | Optional extra delay after input readiness. Clamped to 0-2000 ms. |
 | `debounceMs` | `300` | Number | Global double-launch guard. Clamped to 0-5000 ms. |
 | `transitionCaptureMs` | `3500` | Number | Maximum capture window during launcher activation. Clamped to 50-10000 ms. |
@@ -262,6 +295,13 @@ Quick tests:
 ```
 
 ## Changelog
+
+### 1.0.4-dev
+
+- Optional Command Palette placement, including semantic horizontal alignment with Start.
+- Native no-animation Start dismissal on supported `StartMenu.dll` builds.
+- Correct lifecycle for late hook installation and watcher shutdown.
+- 21 geometry assertions, 11 desktop regressions, six actual placement presets and frame-by-frame control/comparison recordings. See [evidence and remaining limits](docs/presentation-investigation-2026-10-11.md).
 
 ### 1.0.3-dev
 
