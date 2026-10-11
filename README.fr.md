@@ -4,7 +4,7 @@
 
 Ce projet contient un mod Windhawk autonome qui remplace les points d'entrée de Windows Search par un launcher externe. La cible par défaut est PowerToys Command Palette via `x-cmdpal:`. Le mod capture aussi le texte tapé/collé pendant la transition afin d'éviter les caractères perdus ou envoyés dans la mauvaise fenêtre.
 
-Version actuelle du mod : **1.0.2**.
+Préversion actuelle : [**1.0.3-dev**](https://github.com/Fefedu973/Windows-Search-Redirector/releases/tag/v1.0.3-dev). Consulter les [notes de version](docs/releases/1.0.3-dev.md) pour les changements et les limites de validation.
 
 ## Installation
 
@@ -86,7 +86,7 @@ Les hooks symboles Windows sont fragiles par nature: les PDB changent selon les 
 sequenceDiagram
     participant U as Utilisateur
     participant K as Hook clavier
-    participant S as SharedState v5
+    participant S as SharedState v7
     participant L as Thread launcher
     participant C as Command Palette
 
@@ -103,7 +103,7 @@ sequenceDiagram
     L->>S: ConsumePendingTextBatch()
     L->>C: Injecte "abc"
     L->>S: Attend transitionIdleMs sans nouvelle touche
-    L->>S: StopInputCaptureWindow()
+    L->>S: Sous mutex : vérifier le buffer vide, arrêter la capture et libérer la transaction
 ```
 
 ## Détection Win+C
@@ -134,8 +134,8 @@ L'état partagé utilise:
 
 | Élément | Rôle |
 | --- | --- |
-| Mapping `Local\Windhawk.ReplaceWindowsSearchWithApp.SharedState.v5` | Stocke le texte pending, l'état de lancement et les timestamps de capture. Le suffixe `vN` doit être incrémenté à chaque changement de layout de `SharedState`. |
-| Mutex `Local\Windhawk.ReplaceWindowsSearchWithApp.SharedState.Mutex.v5` | Protège le buffer texte entre les processus et récupère proprement les locks abandonnés. |
+| Mapping `Local\Windhawk.ReplaceWindowsSearchWithApp.SharedState.v7` | Stocke le texte, le PID du propriétaire, les timestamps et le délai de repli. Un hôte terminé peut être récupéré sans remplacer un travailleur vivant sur un simple timeout. |
+| Mutex `Local\Windhawk.ReplaceWindowsSearchWithApp.SharedState.Mutex.v7` | Protège le buffer, la décision de capture et la fin de transaction entre processus. |
 | Champ `initialized` | Garantit qu'un seul processus zéro-initialise la mémoire partagée à la création. |
 | `launchInProgress` | Évite que plusieurs processus ouvrent le launcher en même temps. |
 | `captureUntilTick` | Définit la période pendant laquelle les touches sont swallow. |
@@ -146,6 +146,8 @@ Les `SharedStateLock` utilisés depuis les hooks bas niveau ont un timeout court
 ## Clavier Et Texte
 
 La capture respecte le layout clavier actif: le hook maintient un état local des modificateurs puis utilise `ToUnicodeEx` avec le layout du thread foreground. L'injection finale utilise `KEYEVENTF_UNICODE`, ce qui évite les erreurs AZERTY/QWERTY lors de l'envoi vers Command Palette.
+
+Chaque lot UTF-16 est envoyé en un seul `SendInput`, sans temporisation lettre par lettre. Le relâchement d'une touche interceptée est également intercepté. Les événements Unicode externes `VK_PACKET` sont décodés directement ; seuls les événements marqués par le mod lui-même sont systématiquement ignorés. La décision de capturer une lettre et la fin de transaction partagent le même mutex pour éviter d'ajouter une lettre après la fermeture du buffer.
 
 ```mermaid
 flowchart LR
@@ -171,7 +173,7 @@ flowchart TD
     D --> E{"Launcher déjà foreground ?"}
     E -->|"Oui"| F["Continuer la transaction texte"]
     E -->|"Non"| G["TryBeginLaunch global"]
-    G --> H["Fermer la surface Start/Search avec Esc si nécessaire"]
+    G --> H["Garder le shell au premier plan jusqu'au transfert vers le launcher"]
     H --> I{"Type de launcher"}
     I -->|"CommandPalette"| J["ShellExecute x-cmdpal:"]
     I -->|"CustomCommand"| K["ShellExecute customCommand"]
@@ -180,11 +182,17 @@ flowchart TD
     K --> M
     L --> M
     M --> N{"Foreground observé ?"}
-    N -->|"Oui"| O["Envoyer le texte pending"]
-    N -->|"Non"| P["Drop du texte pending et fin de transaction"]
+    N -->|"Oui"| O["Attendre le champ Edit actif de Command Palette puis envoyer le texte"]
+    N -->|"Non"| P["Fin de transaction ; recherche native autorisée pendant 5 secondes"]
 ```
 
 Pour Command Palette, le chemin primaire est `x-cmdpal:`. Le hotkey `Win+Alt+Space` n'est jamais envoyé par défaut afin d'éviter d'ouvrir PowerToys Run. Un hotkey n'est utilisé que si `customHotkey` est explicitement configuré ou si le mode sélectionné est `PowerToys Run` / `Custom hotkey`.
+
+La disponibilité exige une fenêtre du launcher qui répond à un message `WM_NULL` borné à 40 ms, avec un cache de 200 ms. La présence de `PowerToys.exe` seule ne suffit pas. Command Palette peut être masqué tout en étant disponible ; avant la restitution du texte, sa fenêtre doit être visible, non masquée par DWM, au premier plan, et son champ UI Automation Edit doit avoir le focus et être activé. Le délai supplémentaire vaut zéro par défaut, sans écraser les réglages explicites des installations existantes.
+
+Le transfert de focus n'attache plus les files d'entrée, ne force plus le focus sur la fenêtre racine et n'envoie plus Échap avant l'ouverture. Après un refus de mise au premier plan, une séquence Alt masquée peut débloquer l'activation, uniquement si aucun modificateur Shift/Ctrl/Alt/Win n'est enfoncé, afin de ne pas changer le layout clavier. Le relâchement de Win après un Win+S intercepté est masqué pour ne pas rouvrir Démarrer.
+
+Si le launcher est absent ou ne répond pas avant l'interception, Windows gère normalement la recherche. S'il échoue **après** l'interception, la requête en cours est abandonnée plutôt qu'envoyée dans une autre application ; les nouvelles recherches passent à Windows pendant cinq secondes. Ce mécanisme ne restaure pas automatiquement la première requête. La fermeture instantanée de Démarrer sans animation reste **non implémentée**.
 
 En mode `Custom hotkey`, `customProcessName` est requis pour détecter le foreground et transférer du texte. En mode `Custom command`, il est également requis si la commande est une URI ou si le nom de processus ne peut pas être inféré depuis un `.exe`.
 
@@ -193,12 +201,12 @@ En mode `Custom hotkey`, `customProcessName` est requis pour détecter le foregr
 | Paramètre | Défaut | Type UI | Effet |
 | --- | --- | --- | --- |
 | `launcher` | `commandPalette` | Combobox | Choisit Command Palette, PowerToys Run, custom hotkey ou custom command. Les anciennes valeurs `0`, `1`, `2`, `3` sont toujours acceptées. |
-| `requireLauncherAvailable` | `true` | Toggle | Si activé, ne redirige que si le processus cible est déjà lancé. |
+| `requireLauncherAvailable` | `true` | Toggle | Ne redirige que si le launcher possède une fenêtre réactive ; sinon conserve Windows Search. |
 | `customProcessName` | vide | Texte | Processus utilisés pour availability/foreground, séparés par `,` ou `;`. |
 | `customHotkey` | vide | Texte | Hotkey optionnel: `win+alt+space`, `ctrl+space`, `alt+space`, etc. |
 | `customCommand` | vide | Texte | Exécutable, commande ou URI custom. |
 | `customCommandArgs` | vide | Texte | Arguments pour un exécutable custom. Ignoré pour les URI. |
-| `textCaptureDelayMs` | `180` | Nombre | Délai avant injection une fois le launcher foreground. Borné à 0-2000 ms. |
+| `textCaptureDelayMs` | `0` | Nombre | Délai supplémentaire facultatif après vérification du champ de saisie. Borné à 0-2000 ms. |
 | `debounceMs` | `300` | Nombre | Anti double-lancement global. Borné à 0-5000 ms. |
 | `transitionCaptureMs` | `3500` | Nombre | Fenêtre max de capture pendant l'ouverture. Bornée à 50-10000 ms. |
 | `transitionIdleMs` | `80` | Nombre | Temps sans input avant fin de transaction. Borné à 0-1000 ms. |
@@ -254,6 +262,15 @@ Tests rapides:
 ```
 
 ## Historique
+
+### 1.0.3-dev
+
+- Disponibilité fondée sur une fenêtre réactive et repli partagé après échec d'activation.
+- Vérification du premier plan et du champ de saisie, sans attacher les files d'entrée ni envoyer Échap trop tôt.
+- Fin de capture atomique, restitution Unicode par lots et interception des relâchements associés.
+- Suppression du délai supplémentaire par défaut ; les réglages explicites existants restent conservés.
+- Suite réelle : `tests/run-runtime-regression.ps1`, à lancer sans toucher au clavier ou à la souris. Aucune commande n'est exécutée et le presse-papiers reste intact.
+- Résultats et limites : [rapport du 11 octobre 2026](docs/runtime-investigation-2026-10-11.md).
 
 ### 1.0.2
 
