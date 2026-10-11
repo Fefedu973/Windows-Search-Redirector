@@ -2,14 +2,14 @@
 // @id              replace-windows-search-with-app
 // @name            Windows Search Redirector
 // @description     Redirects Windows Search to Command Palette, PowerToys Run, or a custom launcher and forwards initial text
-// @version         1.0.2
+// @version         1.0.3-dev
 // @author          Fefedu973
 // @github          https://github.com/Fefedu973
 // @include         explorer.exe
 // @include         StartMenuExperienceHost.exe
 // @include         SearchHost.exe
 // @architecture    x86-64
-// @compilerOptions -luser32 -lshlwapi -lshell32 -loleaut32 -lole32 -lruntimeobject
+// @compilerOptions -luser32 -lshlwapi -lshell32 -loleaut32 -lole32 -lruntimeobject -ldwmapi
 // ==/WindhawkMod==
 
 // ==WindhawkModReadme==
@@ -47,11 +47,11 @@ settings reference and testing commands.
     - customHotkey: Custom hotkey
     - customCommand: Custom command or URI
 - requireLauncherAvailable: true
-  $name: Require launcher process to be running
+  $name: Keep Windows Search if the launcher is unavailable
   $description: >-
     If enabled, Windows Search is left untouched when the configured launcher
-    process is not running. For Command Palette this requires
-    Microsoft.CmdPal.UI.exe to already exist.
+    process is not running or has no responsive launcher window. For Command
+    Palette this requires Microsoft.CmdPal.UI.exe, not just PowerToys.exe.
 - customProcessName: ""
   $name: Custom launcher process name
   $description: >-
@@ -71,11 +71,11 @@ settings reference and testing commands.
 - customCommandArgs: ""
   $name: Custom command arguments
   $description: Arguments passed to the custom executable, ignored for URI use.
-- textCaptureDelayMs: 180
-  $name: Text injection delay in milliseconds
+- textCaptureDelayMs: 0
+  $name: Additional text injection delay in milliseconds
   $description: >-
-    Delay after the replacement launcher reaches the foreground before buffered
-    text is pasted or injected.
+    Optional extra delay after the launcher input is ready. Normally leave at
+    zero: Command Palette readiness is checked before sending buffered text.
 - debounceMs: 300
   $name: Launch debounce in milliseconds
   $description: Minimum delay between independent launcher activation attempts.
@@ -155,9 +155,9 @@ settings reference and testing commands.
 #include <windhawk_utils.h>
 
 #include <windows.h>
+#include <dwmapi.h>
 #include <initguid.h>
 #include <shlwapi.h>
-#include <tlhelp32.h>
 #include <uiautomation.h>
 
 #undef GetCurrentTime
@@ -192,7 +192,7 @@ enum class LauncherTarget {
 
 struct SettingsSnapshot {
     DWORD debounceMs = 300;
-    DWORD textCaptureDelayMs = 180;
+    DWORD textCaptureDelayMs = 0;
     DWORD transitionCaptureMs = 3500;
     DWORD transitionIdleMs = 80;
     bool allowInjectedInput = true;
@@ -231,7 +231,6 @@ static volatile LONG g_redirectUndockedSearchEnabled = 1;
 static volatile LONG g_redirectSearchProtocolEnabled = 1;
 static volatile LONG64 g_targetAvailableCacheTick = 0;
 static volatile LONG g_targetAvailableCacheValue = 0;
-static volatile LONG64 g_ignoreInjectedUntilTick = 0;
 static volatile LONG g_unloading = 0;
 constexpr ULONG_PTR kOwnInjectedInputMarker = 0x575253484B494E50ULL;
 
@@ -311,7 +310,7 @@ static void LoadSettings() {
     }
 
     next.textCaptureDelayMs = ClampDwordSetting(
-        Wh_GetIntSetting(L"textCaptureDelayMs"), 0, 2000, 180);
+        Wh_GetIntSetting(L"textCaptureDelayMs"), 0, 2000, 0);
     next.debounceMs =
         ClampDwordSetting(Wh_GetIntSetting(L"debounceMs"), 0, 5000, 300);
     next.transitionCaptureMs = ClampDwordSetting(
@@ -419,9 +418,9 @@ static TargetProcess DetectTargetProcess() {
 // -------------------- Shared cross-process state --------------------
 
 constexpr wchar_t kSharedStateName[] =
-    L"Local\\Windhawk.ReplaceWindowsSearchWithApp.SharedState.v5";
+    L"Local\\Windhawk.ReplaceWindowsSearchWithApp.SharedState.v7";
 constexpr wchar_t kSharedMutexName[] =
-    L"Local\\Windhawk.ReplaceWindowsSearchWithApp.SharedState.Mutex.v5";
+    L"Local\\Windhawk.ReplaceWindowsSearchWithApp.SharedState.Mutex.v7";
 constexpr size_t kMaxPendingTextLength = 512;
 constexpr ULONGLONG kPendingTextMaxAgeMs = 10000;
 
@@ -432,6 +431,8 @@ struct SharedState {
     volatile LONG64 pendingTextTick;
     volatile LONG64 captureUntilTick;
     volatile LONG64 lastInputTick;
+    volatile LONG64 activationFailedUntilTick;
+    DWORD launchOwnerPid;
     volatile LONG pendingTextCanPasteOriginal;
     wchar_t pendingText[kMaxPendingTextLength];
 };
@@ -764,38 +765,60 @@ static bool TryBeginLaunch(DWORD debounceMs) {
         return true;
     }
 
+    // A crashed Start/Search host must not leave the other injected processes
+    // capturing forever. Recover only a dead owner, never an arbitrary lease
+    // timeout that could create two live workers replaying into the same field.
+    if (g_sharedState->launchInProgress && g_sharedState->launchOwnerPid) {
+        HANDLE owner = OpenProcess(SYNCHRONIZE, FALSE, g_sharedState->launchOwnerPid);
+        bool dead = owner ? WaitForSingleObject(owner, 0) == WAIT_OBJECT_0
+                          : GetLastError() == ERROR_INVALID_PARAMETER;
+        if (owner) CloseHandle(owner);
+        if (dead) {
+            log_if(L"Recovering transaction from terminated host pid=%lu",
+                   g_sharedState->launchOwnerPid);
+            g_sharedState->launchInProgress = 0;
+            g_sharedState->launchOwnerPid = 0;
+        }
+    }
+
     ULONGLONG now = GetTickCount64();
     ULONGLONG last =
         static_cast<ULONGLONG>(InterlockedCompareExchange64(&g_sharedState->lastLaunchTick, 0, 0));
-    if (debounceMs > 0 && last != 0 && (now - last) < debounceMs) {
+    if (debounceMs > 0 && last != 0 && (now - last) < debounceMs &&
+        !HasPendingText()) {
         log_if(L"Debounced global launch");
         return false;
     }
 
     if (InterlockedCompareExchange(&g_sharedState->launchInProgress, 1, 0) != 0) {
-        if (last != 0 && (now - last) > 8000) {
-            log_if(L"Recovering stale launch state");
-            InterlockedExchange(&g_sharedState->launchInProgress, 0);
-            if (InterlockedCompareExchange(&g_sharedState->launchInProgress, 1,
-                                           0) == 0) {
-                InterlockedExchange64(&g_sharedState->lastLaunchTick,
-                                      static_cast<LONG64>(now));
-                return true;
-            }
-        }
-
         log_if(L"Launch already in progress in another process");
         return false;
     }
 
     InterlockedExchange64(&g_sharedState->lastLaunchTick, static_cast<LONG64>(now));
+    g_sharedState->launchOwnerPid = GetCurrentProcessId();
     return true;
 }
 
 static void EndLaunch() {
+    SharedStateLock lock(500);
+    if (!lock.locked()) return;
     if (g_sharedState) {
+        StopInputCaptureWindow();
+        g_sharedState->launchOwnerPid = 0;
         InterlockedExchange(&g_sharedState->launchInProgress, 0);
     }
+}
+
+static bool FinishLaunchIfDrained() {
+    SharedStateLock lock;
+    if (!lock.locked() || !g_sharedState || g_sharedState->pendingText[0]) {
+        return false;
+    }
+    StopInputCaptureWindow();
+    g_sharedState->launchOwnerPid = 0;
+    InterlockedExchange(&g_sharedState->launchInProgress, 0);
+    return true;
 }
 
 // -------------------- Input capture --------------------
@@ -943,6 +966,9 @@ static bool RequestReplacementIfCategoryEnabled(RedirectCategory category,
         return false;
     }
 
+    // Even Start-open suppression must fail open when the target is unavailable.
+    if (!CanRedirectSearch(reason)) return false;
+
     if (IsUndockedSearchIgnored() &&
         (category == RedirectCategory::StartMenuSearchTransitions ||
          category == RedirectCategory::TaskbarSearch ||
@@ -974,17 +1000,6 @@ static std::wstring GetProcessNameFromPid(DWORD pid) {
 
     CloseHandle(process);
     return name;
-}
-
-static bool IsExplorerShellSurface(HWND hwnd) {
-    wchar_t className[256] = {};
-    if (!GetClassNameW(hwnd, className, _countof(className))) {
-        return false;
-    }
-
-    return _wcsicmp(className, L"Shell_TrayWnd") == 0 ||
-           StrStrIW(className, L"Xaml") != nullptr ||
-           StrStrIW(className, L"Windows.UI") != nullptr;
 }
 
 struct ForegroundSnapshot {
@@ -1022,20 +1037,6 @@ static ForegroundSnapshot CaptureForegroundSnapshotCached(DWORD maxAgeMs) {
     cachedHwnd = cachedSnapshot.hwnd;
     cachedTick = now;
     return cachedSnapshot;
-}
-
-static bool IsShellForeground(HWND hwnd, const std::wstring& processName) {
-    if (processName.empty()) {
-        return false;
-    }
-
-    if (_wcsicmp(processName.c_str(), L"StartMenuExperienceHost.exe") == 0 ||
-        _wcsicmp(processName.c_str(), L"SearchHost.exe") == 0) {
-        return true;
-    }
-
-    return _wcsicmp(processName.c_str(), L"explorer.exe") == 0 &&
-           IsExplorerShellSurface(hwnd);
 }
 
 static bool ShouldCaptureTypedSearchInput() {
@@ -1218,6 +1219,14 @@ static std::wstring TranslateKeyToUnicode(const KBDLLHOOKSTRUCT* keyboardInfo) {
         return L"";
     }
 
+    // SendInput(KEYEVENTF_UNICODE) carries UTF-16 in scanCode rather than a
+    // layout-mapped virtual key. ToUnicodeEx cannot translate VK_PACKET.
+    if (keyboardInfo->vkCode == VK_PACKET &&
+        (keyboardInfo->flags & LLKHF_INJECTED)) {
+        wchar_t ch = static_cast<wchar_t>(keyboardInfo->scanCode);
+        return ch && !iswcntrl(ch) ? std::wstring(1, ch) : L"";
+    }
+
     HWND foreground = GetForegroundWindow();
     DWORD foregroundThreadId =
         foreground ? GetWindowThreadProcessId(foreground, nullptr) : 0;
@@ -1275,15 +1284,6 @@ static bool IsPasteShortcut(const KBDLLHOOKSTRUCT* keyboardInfo) {
     }
 
     return false;
-}
-
-static void SuppressOwnInjectedInputFor(DWORD durationMs) {
-    if (durationMs == 0) {
-        return;
-    }
-
-    ULONGLONG until = GetTickCount64() + durationMs;
-    ExtendSharedTickTo(&g_ignoreInjectedUntilTick, until);
 }
 
 static HHOOK g_keyboardHook = nullptr;
@@ -1524,7 +1524,7 @@ static LRESULT CALLBACK LowLevelMouseProc(int nCode,
     return CallNextHookEx(g_mouseHook, nCode, wParam, lParam);
 }
 
-static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
+static LRESULT LowLevelKeyboardProcImpl(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode == HC_ACTION &&
         (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN ||
          wParam == WM_KEYUP || wParam == WM_SYSKEYUP) &&
@@ -1532,10 +1532,6 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
         const auto* keyboardInfo = reinterpret_cast<const KBDLLHOOKSTRUCT*>(lParam);
         const bool injected = (keyboardInfo->flags & LLKHF_INJECTED) != 0;
         if (injected && keyboardInfo->dwExtraInfo == kOwnInjectedInputMarker) {
-            return CallNextHookEx(g_keyboardHook, nCode, wParam, lParam);
-        }
-
-        if (injected && IsLocalTickActive(&g_ignoreInjectedUntilTick)) {
             return CallNextHookEx(g_keyboardHook, nCode, wParam, lParam);
         }
 
@@ -1597,6 +1593,12 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
             return CallNextHookEx(g_keyboardHook, nCode, wParam, lParam);
         }
 
+        // Serialize the capture decision with the worker's final empty-buffer
+        // check. No SendInput call may run while holding this mutex.
+        SharedStateLock captureLock;
+        if (!captureLock.locked()) {
+            return CallNextHookEx(g_keyboardHook, nCode, wParam, lParam);
+        }
         const bool captureActive = IsInputCaptureActive();
         const bool searchTypingContext =
             captureActive ? false : ShouldCaptureTypedSearchInput();
@@ -1680,6 +1682,27 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
     }
 
     return CallNextHookEx(g_keyboardHook, nCode, wParam, lParam);
+}
+
+static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    static bool swallowedKeys[256] = {};
+    LRESULT result = LowLevelKeyboardProcImpl(nCode, wParam, lParam);
+    if (nCode == HC_ACTION && lParam) {
+        const auto* key = reinterpret_cast<const KBDLLHOOKSTRUCT*>(lParam);
+        if (key->vkCode < ARRAYSIZE(swallowedKeys) &&
+            key->dwExtraInfo != kOwnInjectedInputMarker) {
+            const bool down = wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN;
+            const bool up = wParam == WM_KEYUP || wParam == WM_SYSKEYUP;
+            if (down && result == 1) swallowedKeys[key->vkCode] = true;
+            if (up && swallowedKeys[key->vkCode]) {
+                swallowedKeys[key->vkCode] = false;
+                // Do not leak the release of a captured key to the previous
+                // application or revoke the launcher's foreground permission.
+                return 1;
+            }
+        }
+    }
+    return result;
 }
 
 static DWORD WINAPI KeyboardHookThreadProc(LPVOID) {
@@ -1928,33 +1951,8 @@ static std::vector<std::wstring> GetConfiguredReplacementProcessNames(
     }
 }
 
-static bool IsProcessRunningByName(const std::wstring& processName) {
-    if (processName.empty()) {
-        return false;
-    }
-
-    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snapshot == INVALID_HANDLE_VALUE) {
-        return false;
-    }
-
-    PROCESSENTRY32W entry = {};
-    entry.dwSize = sizeof(entry);
-    bool found = false;
-    if (Process32FirstW(snapshot, &entry)) {
-        do {
-            if (_wcsicmp(entry.szExeFile, processName.c_str()) == 0) {
-                found = true;
-                break;
-            }
-        } while (Process32NextW(snapshot, &entry));
-    }
-
-    CloseHandle(snapshot);
-    return found;
-}
-
 static PCWSTR GetLauncherDebugName(LauncherTarget target);
+static bool HasResponsiveReplacementWindow(const SettingsSnapshot& settings);
 
 static bool IsReplacementTargetAvailableUncached(
     const SettingsSnapshot& settings) {
@@ -1981,20 +1979,17 @@ static bool IsReplacementTargetAvailableUncached(
         return true;
     }
 
-    for (const auto& name : processNames) {
-        if (IsProcessRunningByName(name)) {
-            return true;
-        }
-    }
-
-    return false;
+    return HasResponsiveReplacementWindow(settings);
 }
 
 static bool IsReplacementTargetAvailable() {
     ULONGLONG now = GetTickCount64();
+    if (g_sharedState && now < ReadTick(&g_sharedState->activationFailedUntilTick)) {
+        return false;
+    }
     ULONGLONG tick = static_cast<ULONGLONG>(
         InterlockedCompareExchange64(&g_targetAvailableCacheTick, 0, 0));
-    if (tick != 0 && (now - tick) < 1000) {
+    if (tick != 0 && (now - tick) < 200) {
         return InterlockedCompareExchange(&g_targetAvailableCacheValue, 0, 0) !=
                0;
     }
@@ -2060,21 +2055,32 @@ static bool SleepUnlessUnloading(DWORD totalMs,
     return false;
 }
 
+static bool ActivateConfiguredReplacementWindow(const SettingsSnapshot& settings);
+
 static bool WaitForReplacementForeground(DWORD timeoutMs,
                                          const SettingsSnapshot& settings) {
     ULONGLONG deadline = GetTickCount64() + timeoutMs;
+    ULONGLONG nextActivation = GetTickCount64() + 100;
     while (GetTickCount64() < deadline) {
         if (IsUnloading()) {
             return false;
         }
 
         ForegroundSnapshot current = CaptureForegroundSnapshot();
-        if (IsConfiguredReplacementForegroundProcess(current.processName,
-                                                     settings)) {
-            return true;
+        if (IsConfiguredReplacementForegroundProcess(current.processName, settings)) {
+            DWORD cloaked = 0;
+            DwmGetWindowAttribute(current.hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
+            GUITHREADINFO gui = {sizeof(gui)};
+            DWORD thread = GetWindowThreadProcessId(current.hwnd, nullptr);
+            if (IsWindowVisible(current.hwnd) && !cloaked &&
+                GetGUIThreadInfo(thread, &gui) && gui.hwndFocus) return true;
         }
 
-        if (!SleepUnlessUnloading(25)) {
+        if (GetTickCount64() >= nextActivation) {
+            ActivateConfiguredReplacementWindow(settings);
+            nextActivation = GetTickCount64() + 100;
+        }
+        if (!SleepUnlessUnloading(5)) {
             return false;
         }
     }
@@ -2083,27 +2089,26 @@ static bool WaitForReplacementForeground(DWORD timeoutMs,
 }
 
 static void SendUnicodeText(const std::wstring& text) {
-    SuppressOwnInjectedInputFor(static_cast<DWORD>(
-        std::min<size_t>(5000, 700 + text.size() * 8)));
-
+    std::vector<INPUT> inputs;
+    inputs.reserve(text.size() * 2);
     for (wchar_t ch : text) {
-        INPUT inputs[2] = {};
-
-        inputs[0].type = INPUT_KEYBOARD;
-        inputs[0].ki.wScan = ch;
-        inputs[0].ki.dwFlags = KEYEVENTF_UNICODE;
-        inputs[0].ki.dwExtraInfo = kOwnInjectedInputMarker;
-
-        inputs[1] = inputs[0];
-        inputs[1].ki.dwFlags |= KEYEVENTF_KEYUP;
-
-        SuppressOwnInjectedInputFor(700);
-        UINT sent = SendInput(2, inputs, sizeof(INPUT));
-        if (sent != 2) {
-            Wh_Log(L"[ReplaceSearch] SendInput unicode failed: sent=%u error=%u",
-                   sent, GetLastError());
+        INPUT input = {};
+        input.type = INPUT_KEYBOARD;
+        input.ki.wScan = ch;
+        input.ki.dwFlags = KEYEVENTF_UNICODE;
+        input.ki.dwExtraInfo = kOwnInjectedInputMarker;
+        inputs.push_back(input);
+        input.ki.dwFlags |= KEYEVENTF_KEYUP;
+        inputs.push_back(input);
+    }
+    // Unicode preserves the captured layout; a contiguous batch prevents
+    // physical input interleaving with a character-by-character replay.
+    if (!inputs.empty()) {
+        UINT sent = SendInput(static_cast<UINT>(inputs.size()), inputs.data(), sizeof(INPUT));
+        if (sent != inputs.size()) {
+            Wh_Log(L"[ReplaceSearch] SendInput unicode failed: sent=%u/%zu error=%u",
+                   sent, inputs.size(), GetLastError());
         }
-        Sleep(2);
     }
 }
 
@@ -2114,7 +2119,6 @@ static void SendVirtualKey(WORD virtualKey, bool keyUp) {
     input.ki.dwFlags = keyUp ? KEYEVENTF_KEYUP : 0;
     input.ki.dwExtraInfo = kOwnInjectedInputMarker;
 
-    SuppressOwnInjectedInputFor(700);
     UINT sent = SendInput(1, &input, sizeof(input));
     if (sent != 1) {
         Wh_Log(L"[ReplaceSearch] SendInput(%u, keyUp=%d) failed: %u",
@@ -2289,17 +2293,6 @@ static bool SendConfiguredHotkey(const std::wstring& hotkey) {
     return true;
 }
 
-static void DismissWindowsSearchSurfaceIfForeground() {
-    ForegroundSnapshot current = CaptureForegroundSnapshot();
-    if (!IsShellForeground(current.hwnd, current.processName)) {
-        return;
-    }
-
-    log_if(L"Dismissing shell surface before launcher summon");
-    TapVirtualKey(VK_ESCAPE);
-    Sleep(80);
-}
-
 static void SendLauncherHotkey(const SettingsSnapshot& settings) {
     std::wstring hotkey = TrimString(settings.customHotkey);
     if (hotkey.empty()) {
@@ -2458,44 +2451,44 @@ static bool ForceForegroundWindow(HWND hwnd) {
         return false;
     }
 
-    HWND foreground = GetForegroundWindow();
-    DWORD foregroundThreadId = foreground ? GetWindowThreadProcessId(foreground, nullptr) : 0;
-    DWORD targetThreadId = GetWindowThreadProcessId(hwnd, nullptr);
-    DWORD currentThreadId = GetCurrentThreadId();
-
-    bool attachedForeground = false;
-    bool attachedTarget = false;
-    if (foregroundThreadId && foregroundThreadId != currentThreadId) {
-        attachedForeground =
-            AttachThreadInput(currentThreadId, foregroundThreadId, TRUE) != FALSE;
+    // Do not attach input queues or focus the top-level HWND. The launcher
+    // owns its textbox focus; attaching queues can deadlock both applications.
+    if (!IsWindowVisible(hwnd) || IsHungAppWindow(hwnd)) return false;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    BOOL granted = AllowSetForegroundWindow(pid);
+    BOOL activated = SetForegroundWindow(hwnd);
+    if (!activated &&
+        !((GetAsyncKeyState(VK_SHIFT) | GetAsyncKeyState(VK_MENU) |
+           GetAsyncKeyState(VK_CONTROL) | GetAsyncKeyState(VK_LWIN) |
+           GetAsyncKeyState(VK_RWIN)) & 0x8000)) {
+        // Do this only after a denied activation, with no modifiers held.
+        // In particular Alt+Shift would switch the user's keyboard layout.
+        INPUT unlock[4] = {};
+        const WORD keys[] = {VK_MENU, 0x07, 0x07, VK_MENU};
+        for (int i = 0; i < 4; ++i) {
+            unlock[i].type = INPUT_KEYBOARD;
+            unlock[i].ki.wVk = keys[i];
+            unlock[i].ki.dwFlags = i >= 2 ? KEYEVENTF_KEYUP : 0;
+            unlock[i].ki.dwExtraInfo = kOwnInjectedInputMarker;
+        }
+        if (SendInput(4, unlock, sizeof(INPUT)) == 4) {
+            granted = AllowSetForegroundWindow(pid);
+            activated = SetForegroundWindow(hwnd);
+        }
     }
+    log_if(L"Foreground request granted=%d activated=%d actual=%p target=%p",
+           granted, activated, GetForegroundWindow(), hwnd);
+    return GetForegroundWindow() == hwnd;
+}
 
-    if (targetThreadId && targetThreadId != currentThreadId &&
-        targetThreadId != foregroundThreadId) {
-        attachedTarget = AttachThreadInput(currentThreadId, targetThreadId, TRUE) != FALSE;
-    }
-
-    AllowSetForegroundWindow(ASFW_ANY);
-
-    ShowWindow(hwnd, SW_RESTORE);
-    SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
-                 SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
-    SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
-                 SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
-    BringWindowToTop(hwnd);
-    SetActiveWindow(hwnd);
-    BOOL foregroundSet = SetForegroundWindow(hwnd);
-    SetFocus(hwnd);
-
-    if (attachedTarget) {
-        AttachThreadInput(currentThreadId, targetThreadId, FALSE);
-    }
-
-    if (attachedForeground) {
-        AttachThreadInput(currentThreadId, foregroundThreadId, FALSE);
-    }
-
-    return foregroundSet || GetForegroundWindow() == hwnd;
+static bool HasResponsiveReplacementWindow(const SettingsSnapshot& settings) {
+    ReplacementWindowCandidate candidate;
+    if (!FindBestReplacementWindowCandidate(settings, &candidate) ||
+        IsHungAppWindow(candidate.hwnd)) return false;
+    DWORD_PTR result = 0;
+    return SendMessageTimeoutW(candidate.hwnd, WM_NULL, 0, 0,
+        SMTO_ABORTIFHUNG | SMTO_BLOCK, 40, &result) != 0;
 }
 
 static bool ActivateConfiguredReplacementWindow(
@@ -2520,7 +2513,27 @@ static bool OpenReplacementWindow(const SettingsSnapshot& settings) {
         return false;
     }
 
-    DismissWindowsSearchSurfaceIfForeground();
+    // A swallowed Win+S must not become a bare Windows-key release: that
+    // reopens Start and immediately deactivates/cloaks Command Palette.
+    if ((GetAsyncKeyState(VK_LWIN) | GetAsyncKeyState(VK_RWIN)) & 0x8000) {
+        TapVirtualKey(0x07);  // Unassigned menu-mask key, not a user shortcut.
+        const auto releaseDeadline = GetTickCount64() + 500;
+        while (((GetAsyncKeyState(VK_LWIN) | GetAsyncKeyState(VK_RWIN)) & 0x8000) &&
+               GetTickCount64() < releaseDeadline && !IsUnloading()) Sleep(5);
+    }
+
+    // Transfer foreground permission while Start still owns it, not after
+    // Escape has returned it to an unrelated application.
+    ReplacementWindowCandidate candidate;
+    if (FindBestReplacementWindowCandidate(settings, &candidate)) {
+        DWORD pid = 0;
+        GetWindowThreadProcessId(candidate.hwnd, &pid);
+        AllowSetForegroundWindow(pid);
+    }
+
+    // Keep the shell as foreground until the launcher takes over. Sending Esc
+    // first restores the previous application and races its activation with
+    // the protocol handler's foreground request.
 
     if (IsUnloading()) {
         return false;
@@ -2565,6 +2578,41 @@ static bool OpenReplacementWindow(const SettingsSnapshot& settings) {
 
     log_if(L"%s foreground was not observed",
            GetLauncherDebugName(settings.launcherTarget));
+    return false;
+}
+
+static bool WaitForLauncherInputReady(const SettingsSnapshot& settings) {
+    if (settings.launcherTarget != LauncherTarget::CommandPalette) {
+        return WaitForReplacementForeground(1000, settings);
+    }
+    winrt::com_ptr<IUIAutomation> automation;
+    if (FAILED(CoCreateInstance(CLSID_CUIAutomation8, nullptr, CLSCTX_INPROC_SERVER,
+                                IID_PPV_ARGS(automation.put())))) return false;
+    auto automation2 = automation.try_as<IUIAutomation2>();
+    if (automation2) {
+        automation2->put_ConnectionTimeout(150);
+        automation2->put_TransactionTimeout(150);
+    }
+    const ULONGLONG deadline = GetTickCount64() + 1500;
+    while (!IsUnloading() && GetTickCount64() < deadline) {
+        ForegroundSnapshot fg = CaptureForegroundSnapshot();
+        if (!IsConfiguredReplacementForegroundProcess(fg.processName, settings)) return false;
+        winrt::com_ptr<IUIAutomationElement> focused;
+        if (SUCCEEDED(automation->GetFocusedElement(focused.put())) && focused) {
+            int pid = 0;
+            DWORD foregroundPid = 0;
+            GetWindowThreadProcessId(fg.hwnd, &foregroundPid);
+            CONTROLTYPEID type = 0;
+            BOOL hasFocus = FALSE, enabled = FALSE;
+            focused->get_CurrentProcessId(&pid);
+            focused->get_CurrentControlType(&type);
+            focused->get_CurrentHasKeyboardFocus(&hasFocus);
+            focused->get_CurrentIsEnabled(&enabled);
+            if (pid == static_cast<int>(foregroundPid) && type == UIA_EditControlTypeId &&
+                hasFocus && enabled) return true;
+        }
+        Sleep(5);
+    }
     return false;
 }
 
@@ -2653,16 +2701,28 @@ static void WaitForLaunchThreadsAndCloseTracking() {
 
 static DWORD WINAPI LaunchThreadProc(LPVOID) {
     LaunchThreadLifetime lifetime;
+    struct ComLifetime {
+        HRESULT result = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        ~ComLifetime() { if (SUCCEEDED(result)) CoUninitialize(); }
+    } comLifetime;
     SettingsSnapshot settings = GetSettingsSnapshot();
     PCWSTR launcherName = GetLauncherDebugName(settings.launcherTarget);
+    const auto started = GetTickCount64();
+    const auto foreground = CaptureForegroundSnapshot();
+    const bool alreadyForeground = IsConfiguredReplacementForegroundProcess(foreground.processName, settings);
 
-    if (IsUnloading() || !OpenReplacementWindow(settings)) {
+    if (IsUnloading() || (!alreadyForeground && !OpenReplacementWindow(settings)) ||
+        !WaitForLauncherInputReady(settings)) {
         Wh_Log(L"[ReplaceSearch] Failed to activate %s", launcherName);
+        if (g_sharedState) {
+            InterlockedExchange64(&g_sharedState->activationFailedUntilTick, GetTickCount64() + 5000);
+        }
+        SharedStateLock lock(500);
         ClearPendingText();
-        StopInputCaptureWindow();
         EndLaunch();
         return 0;
     }
+    log_if(L"Launcher input ready after %llu ms", GetTickCount64() - started);
 
     if (settings.textCaptureDelayMs > 0 &&
         !SleepUnlessUnloading(settings.textCaptureDelayMs)) {
@@ -2674,7 +2734,7 @@ static DWORD WINAPI LaunchThreadProc(LPVOID) {
 
     ULONGLONG hardDeadline = GetTickCount64() + 10000;
     for (;;) {
-        if (IsUnloading()) {
+        if (IsUnloading() || GetTickCount64() >= hardDeadline) {
             ClearPendingText();
             break;
         }
@@ -2696,36 +2756,25 @@ static DWORD WINAPI LaunchThreadProc(LPVOID) {
         PendingTextBatch batch = ConsumePendingTextBatch();
         if (!batch.text.empty()) {
             SendPendingTextBatch(batch, settings.launcherTarget);
-            if (!SleepUnlessUnloading(15)) {
+            if (!SleepUnlessUnloading(1)) {
                 ClearPendingText();
                 break;
             }
             continue;
         }
 
-        if (!IsInputCaptureActive() || IsCaptureIdle(settings.transitionIdleMs) ||
-            GetTickCount64() >= hardDeadline) {
-            break;
-        } else if (!SleepUnlessUnloading(15)) {
+        if ((!IsInputCaptureActive() || IsCaptureIdle(settings.transitionIdleMs)) &&
+            FinishLaunchIfDrained()) {
+            log_if(L"Input transaction completed after %llu ms", GetTickCount64() - started);
+            return 0;
+        } else if (!SleepUnlessUnloading(5)) {
             ClearPendingText();
             break;
         }
     }
 
-    PendingTextBatch finalBatch = IsUnloading() ? PendingTextBatch{}
-                                                : ConsumePendingTextBatch();
-    if (!finalBatch.text.empty()) {
-        ForegroundSnapshot current = CaptureForegroundSnapshot();
-        if (IsConfiguredReplacementForegroundProcess(current.processName,
-                                                     settings)) {
-            SendPendingTextBatch(finalBatch, settings.launcherTarget);
-        } else {
-            log_if(L"Dropping final pending text because %s is not foreground length=%zu",
-                   launcherName, finalBatch.text.size());
-        }
-    }
-
-    StopInputCaptureWindow();
+    SharedStateLock lock(500);
+    ClearPendingText();
     EndLaunch();
     return 0;
 }
@@ -2741,17 +2790,16 @@ static bool LaunchReplacement() {
     }
 
     SettingsSnapshot settings = GetSettingsSnapshot();
-    ForegroundSnapshot current = CaptureForegroundSnapshot();
-    if (IsConfiguredReplacementForegroundProcess(current.processName, settings)) {
-        ExtendInputCaptureWindow(settings.transitionCaptureMs);
-        return true;
-    }
-
-    ExtendInputCaptureWindow(settings.transitionCaptureMs);
+    SharedStateLock lock;
+    if (!lock.locked()) return false;
 
     if (!TryBeginLaunch(settings.debounceMs)) {
+        if (g_sharedState && InterlockedCompareExchange(&g_sharedState->launchInProgress, 0, 0)) {
+            ExtendInputCaptureWindow(settings.transitionCaptureMs);
+        }
         return true;
     }
+    ExtendInputCaptureWindow(settings.transitionCaptureMs);
 
     if (!RegisterLaunchThreadIfAllowed()) {
         StopInputCaptureWindow();
@@ -3318,6 +3366,7 @@ static bool HandleUndockedSearchActivation(PCWSTR hookName) {
     if (!IsRedirectCategoryEnabled(RedirectCategory::UndockedSearch)) {
         return false;
     }
+    if (!CanRedirectSearch(hookName)) return false;
 
     if (IsUndockedSearchIgnored()) {
         log_if(L"%s suppressed as Start/taskbar-open side effect", hookName);

@@ -2,9 +2,9 @@
 
 > English version · [Version française](README.fr.md)
 
-This project is a self-contained Windhawk mod that replaces the Windows Search entry points with an external launcher. The default target is PowerToys Command Palette via `x-cmdpal:`. The mod also captures text typed or pasted during the transition so characters are never lost or sent to the wrong window.
+This project is a self-contained Windhawk mod that replaces the Windows Search entry points with an external launcher. The default target is PowerToys Command Palette via `x-cmdpal:`. The mod buffers text typed or pasted during activation and checks the destination before replaying it. See the limitations below: activation failure is not a lossless recovery path.
 
-Current mod version: **1.0.2**.
+Current pre-release: [**1.0.3-dev**](https://github.com/Fefedu973/Windows-Search-Redirector/releases/tag/v1.0.3-dev). See the [release notes](docs/releases/1.0.3-dev.md) for changes and verification limits.
 
 ## Installation
 
@@ -86,7 +86,7 @@ Windows symbol hooks are inherently fragile: the PDBs change between builds. Hoo
 sequenceDiagram
     participant U as User
     participant K as Keyboard hook
-    participant S as SharedState v5
+    participant S as SharedState v7
     participant L as Launcher thread
     participant C as Command Palette
 
@@ -103,7 +103,7 @@ sequenceDiagram
     L->>S: ConsumePendingTextBatch()
     L->>C: Inject "abc"
     L->>S: Wait transitionIdleMs without new keys
-    L->>S: StopInputCaptureWindow()
+    L->>S: Under mutex: verify empty, stop capture, release launch ownership
 ```
 
 ## Win+C Detection
@@ -134,8 +134,8 @@ The shared state uses:
 
 | Element | Role |
 | --- | --- |
-| Mapping `Local\Windhawk.ReplaceWindowsSearchWithApp.SharedState.v5` | Stores the pending text, launch state and capture timestamps. The `vN` suffix is bumped whenever `SharedState`'s layout changes. |
-| Mutex `Local\Windhawk.ReplaceWindowsSearchWithApp.SharedState.Mutex.v5` | Protects the text buffer across processes and recovers cleanly from abandoned locks. |
+| Mapping `Local\Windhawk.ReplaceWindowsSearchWithApp.SharedState.v7` | Stores pending text, launch owner PID, timestamps and failure cooldown. The `vN` suffix changes with the layout. A terminated owner can be recovered without taking over a live worker on a timer. |
+| Mutex `Local\Windhawk.ReplaceWindowsSearchWithApp.SharedState.Mutex.v7` | Protects the buffer, capture decision and transaction completion across processes. |
 | `initialized` field | Ensures only one process zero-initializes the shared memory at creation. |
 | `launchInProgress` | Prevents multiple processes from opening the launcher concurrently. |
 | `captureUntilTick` | Defines the period during which keys are swallowed. |
@@ -146,6 +146,8 @@ The shared state uses:
 ## Keyboard And Text
 
 Capture respects the active keyboard layout: the hook keeps a local modifier state and uses `ToUnicodeEx` with the foreground thread's layout. The final injection uses `KEYEVENTF_UNICODE`, which avoids AZERTY/QWERTY mismatches when forwarding to Command Palette.
+
+Replay submits an entire UTF-16 batch with one `SendInput`, not a timed loop per character. Key-up events paired with swallowed key-downs are swallowed too. External `VK_PACKET` Unicode input is decoded directly; only the mod's own marked events bypass capture unconditionally. Finishing a transaction and accepting a new character use the same mutex, so a late character cannot be appended after the worker has declared the buffer empty.
 
 ```mermaid
 flowchart LR
@@ -171,7 +173,7 @@ flowchart TD
     D --> E{"Launcher already foreground?"}
     E -->|"Yes"| F["Continue text transaction"]
     E -->|"No"| G["TryBeginLaunch global"]
-    G --> H["Dismiss the Start/Search surface with Esc if needed"]
+    G --> H["Keep shell foreground until the launcher takes over"]
     H --> I{"Launcher type"}
     I -->|"CommandPalette"| J["ShellExecute x-cmdpal:"]
     I -->|"CustomCommand"| K["ShellExecute customCommand"]
@@ -180,11 +182,17 @@ flowchart TD
     K --> M
     L --> M
     M --> N{"Foreground observed?"}
-    N -->|"Yes"| O["Send pending text"]
-    N -->|"No"| P["Drop pending text and end transaction"]
+    N -->|"Yes"| O["Wait for focused, enabled Command Palette Edit; replay text"]
+    N -->|"No"| P["End transaction; native Search allowed for 5 seconds"]
 ```
 
 For Command Palette, the primary path is `x-cmdpal:`. The `Win+Alt+Space` hotkey is never sent by default to avoid opening PowerToys Run instead. A hotkey is only used when `customHotkey` is explicitly configured or when the selected mode is `PowerToys Run` / `Custom hotkey`.
+
+Availability requires a matching launcher window and a successful bounded `WM_NULL` responsiveness probe (40 ms, cached for 200 ms). `PowerToys.exe` alone is insufficient. A hidden/cloaked but responsive Command Palette is eligible to be summoned; it must be visible, uncloaked, foreground and have a focused enabled UI Automation Edit before text is replayed. The extra injection delay defaults to zero. Existing installations retain their explicit delay setting.
+
+Foreground activation no longer attaches input queues, focuses a top-level HWND, flips topmost state, or sends Escape before launching. After a denied foreground request, a masked Alt sequence can unlock activation, but only with no Shift/Ctrl/Alt/Win held, to avoid triggering a keyboard-layout shortcut. A swallowed Win+S is masked before Windows-key release so it does not become a bare Win press.
+
+If the launcher disappears or becomes unresponsive before admission, the original hook runs normally. If activation fails **after** admission, the current buffered query is discarded rather than sent to an unrelated application; subsequent requests pass through for five seconds. This is not automatic restoration of the first query. Instant, animation-free Start dismissal is **not implemented** in this version.
 
 In `Custom hotkey` mode, `customProcessName` is required to detect the foreground and forward text. In `Custom command` mode it is also required when the command is a URI or when the process name cannot be inferred from a `.exe`.
 
@@ -193,12 +201,12 @@ In `Custom hotkey` mode, `customProcessName` is required to detect the foregroun
 | Setting | Default | UI type | Effect |
 | --- | --- | --- | --- |
 | `launcher` | `commandPalette` | Combobox | Choose Command Palette, PowerToys Run, custom hotkey or custom command. The legacy values `0`, `1`, `2`, `3` are still accepted. |
-| `requireLauncherAvailable` | `true` | Toggle | When enabled, only redirect if the target process is already running. |
+| `requireLauncherAvailable` | `true` | Toggle | Only redirect when the actual launcher has a responsive window. Otherwise preserve native Search. |
 | `customProcessName` | empty | Text | Process names for availability/foreground checks, separated by `,` or `;`. |
 | `customHotkey` | empty | Text | Optional hotkey, e.g. `win+alt+space`, `ctrl+space`, `alt+space`. |
 | `customCommand` | empty | Text | Custom executable, command or URI. |
 | `customCommandArgs` | empty | Text | Arguments for a custom executable. Ignored for URI commands. |
-| `textCaptureDelayMs` | `180` | Number | Delay before injection once the launcher reaches foreground. Clamped to 0-2000 ms. |
+| `textCaptureDelayMs` | `0` | Number | Optional extra delay after input readiness. Clamped to 0-2000 ms. |
 | `debounceMs` | `300` | Number | Global double-launch guard. Clamped to 0-5000 ms. |
 | `transitionCaptureMs` | `3500` | Number | Maximum capture window during launcher activation. Clamped to 50-10000 ms. |
 | `transitionIdleMs` | `80` | Number | Time without input before a transaction completes. Clamped to 0-1000 ms. |
@@ -254,6 +262,15 @@ Quick tests:
 ```
 
 ## Changelog
+
+### 1.0.3-dev
+
+- Responsive-window availability checks and shared activation-failure cooldown.
+- Foreground/input-readiness checks without input-queue attachment or premature Escape.
+- Atomic capture completion, batched Unicode replay and paired key-up suppression.
+- Zero default extra injection delay; explicit existing settings are preserved.
+- Real desktop regression suite: `tests/run-runtime-regression.ps1`. Requires an idle desktop; do not use the mouse or keyboard while it runs. No command is executed and the clipboard is untouched.
+- Investigation and verification details: [2026-10-11 report](docs/runtime-investigation-2026-10-11.md).
 
 ### 1.0.2
 

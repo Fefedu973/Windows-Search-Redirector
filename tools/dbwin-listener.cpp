@@ -1,6 +1,7 @@
 #include <windows.h>
 #include <cstdio>
 #include <string>
+#include <share.h>
 
 struct DbWinBuffer {
     DWORD pid;
@@ -26,7 +27,7 @@ int wmain(int argc, wchar_t** argv) {
         return 1;
     }
     FILE* f = nullptr;
-    _wfopen_s(&f, outPath, L"ab");
+    f = _wfsopen(outPath, L"ab", _SH_DENYNO);
     if (!f) return 1;
     DWORD start = GetTickCount();
     DWORD duration = argc >= 3 ? _wtoi(argv[2]) : 30000;
