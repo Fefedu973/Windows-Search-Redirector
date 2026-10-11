@@ -4,7 +4,9 @@
 
 Ce projet contient un mod Windhawk autonome qui remplace les points d'entrée de Windows Search par un launcher externe. La cible par défaut est PowerToys Command Palette via `x-cmdpal:`. Le mod capture aussi le texte tapé/collé pendant la transition afin d'éviter les caractères perdus ou envoyés dans la mauvaise fenêtre.
 
-Préversion actuelle : [**1.0.3-dev**](https://github.com/Fefedu973/Windows-Search-Redirector/releases/tag/v1.0.3-dev). Consulter les [notes de version](docs/releases/1.0.3-dev.md) pour les changements et les limites de validation.
+Préversion actuelle : [**1.0.4-dev**](https://github.com/Fefedu973/Windows-Search-Redirector/releases/tag/v1.0.4-dev). Consulter les [notes de version](docs/releases/1.0.4-dev.md) pour les changements et les limites de validation.
+
+Cette version ajoute la fermeture native de Démarrer sans animation sur les builds compatibles et le placement facultatif de Command Palette. Voir [l'investigation et les preuves de test](docs/presentation-investigation-2026-10-11.md).
 
 ## Installation
 
@@ -25,6 +27,9 @@ La configuration par défaut cible PowerToys Command Palette. PowerToys Run, un 
 | `tools/bin/dbwin-listener.exe` | Binaire local du listener de logs. |
 | `tests/wh-test-input.cpp` | Harnais de test pour simuler les entrées Start/Search. |
 | `tests/bin/wh-test-input.exe` | Binaire local du harnais de test. |
+| `tests/runtime-regression.cpp` | Régressions sur le bureau, clic sémantique sur la recherche et vérification du placement réel. |
+| `tests/palette-placement.cpp` | Tests autonomes de la géométrie utilisée par le mod monofichier. |
+| `tests/record-start-dismiss.ps1`, `tests/analyze-start-dismiss.py` | Capture des transitions, suivi du bord de Démarrer avec les horodatages réels et planche de comparaison. |
 
 ## Vue D'ensemble
 
@@ -63,7 +68,7 @@ Le mod est injecté dans trois processus:
 | Processus | Responsabilité |
 | --- | --- |
 | `explorer.exe` | Coordination principale, hooks clavier/souris globaux, hook protocole Search, fallback UIA, hooks `twinui.pcshell.dll` quand disponible. |
-| `StartMenuExperienceHost.exe` | Hooks `StartDocked.dll` pour les transitions de l'UI Start vers Search. |
+| `StartMenuExperienceHost.exe` | Hooks `StartDocked.dll` pour les transitions vers Search ; factory native de fermeture du nouveau `StartMenu.dll` lorsqu'elle est disponible. |
 | `SearchHost.exe` | Hooks `SearchUx.UI.dll` pour les chemins taskbar/SearchHost. |
 
 ## Matrice Des Hooks
@@ -192,9 +197,32 @@ La disponibilité exige une fenêtre du launcher qui répond à un message `WM_N
 
 Le transfert de focus n'attache plus les files d'entrée, ne force plus le focus sur la fenêtre racine et n'envoie plus Échap avant l'ouverture. Après un refus de mise au premier plan, une séquence Alt masquée peut débloquer l'activation, uniquement si aucun modificateur Shift/Ctrl/Alt/Win n'est enfoncé, afin de ne pas changer le layout clavier. Le relâchement de Win après un Win+S intercepté est masqué pour ne pas rouvrir Démarrer.
 
-Si le launcher est absent ou ne répond pas avant l'interception, Windows gère normalement la recherche. S'il échoue **après** l'interception, la requête en cours est abandonnée plutôt qu'envoyée dans une autre application ; les nouvelles recherches passent à Windows pendant cinq secondes. Ce mécanisme ne restaure pas automatiquement la première requête. La fermeture instantanée de Démarrer sans animation reste **non implémentée**.
+Si le launcher est absent ou ne répond pas avant l'interception, Windows gère normalement la recherche. S'il échoue **après** l'interception, la requête en cours est abandonnée plutôt qu'envoyée dans une autre application ; les nouvelles recherches passent à Windows pendant cinq secondes. Ce mécanisme ne restaure pas automatiquement la première requête.
 
 En mode `Custom hotkey`, `customProcessName` est requis pour détecter le foreground et transférer du texte. En mode `Custom command`, il est également requis si la commande est une URI ou si le nom de processus ne peut pas être inféré depuis un `.exe`.
+
+## Fermeture Et Placement
+
+Le nouveau menu Démarrer possède deux factories dans `StartMenu.dll` : `AnimationProvider::CreateDismissAnimation()` et `CreateDismissNoAnimation()`. Si `instantStartDismiss` est activé et qu'une transaction de redirection est en cours, le mod substitue la seconde à la première. Windows conserve la gestion de la désactivation, de la composition et des callbacks de fin. Le mod ne masque pas brutalement le HWND de Démarrer, ne change pas les préférences système d'animation et n'appelle pas un presenter privé d'Explorer via un pointeur d'objet non vérifié. Si un symbole manque, la fermeture normale reste utilisée.
+
+```mermaid
+flowchart LR
+    A["Le launcher prend le premier plan"] --> B["Windows ferme Démarrer"]
+    B --> C["Hook CreateDismissAnimation dans StartMenu.dll"]
+    C --> D{"Option active + redirection en cours + factory disponible ?"}
+    D -->|Oui| E["CreateDismissNoAnimation"]
+    D -->|Non| F["Factory animée originale"]
+    E --> G["Windows termine son cycle normal de fermeture"]
+    F --> G
+```
+
+Cela supprime le glissement, pas le temps nécessaire pour ouvrir le launcher. Dans la capture témoin, le glissement dure environ 200 ms ; avec le hook, Démarrer est immobile sur une image puis absent sur la suivante, 17 ms plus tard. Cette mesure concerne le build testé, sans garantir une durée inférieure à une image ni une compatibilité avec toutes les versions de Windows.
+
+Le placement de Command Palette est facultatif : neuf positions sur l'écran, pourcentages personnalisés ou **Follow Start horizontally**. Ce dernier mode lit le rectangle du contrôle visible `SearchBoxToggleButton` via UI Automation avant l'activation, aligne les centres horizontalement et conserve la position verticale native dans la zone de travail. Il n'utilise ni coordonnées devinées ni le HWND plein écran de Démarrer. Sans Démarrer visible ou si le contrôle est introuvable, aucune modification n'est faite.
+
+Les positions fixes/personnalisées peuvent utiliser l'écran choisi par PowerToys, celui de la fenêtre source, celui de la souris ou l'écran principal. Le calcul respecte la zone de travail, la barre des tâches et la marge ajustée au DPI. Les pourcentages décrivent le déplacement disponible pour la fenêtre entière. Seule la fenêtre Command Palette vérifiée, visible et au premier plan est déplacée, sans changer son activation, sa taille ou son ordre d'empilement. Une palette déjà au premier plan, PowerToys Run, les launchers personnalisés et les ouvertures manuelles de Command Palette ne sont pas déplacés. Le mode par défaut n'ajoute ni recherche UIA ni déplacement. Une correction bornée est possible après un changement de DPI entre écrans, sans contrer en continu un déplacement manuel.
+
+Les hooks des DLL chargées tardivement sont appliqués par un thread démarré dans `Wh_ModAfterInit`. Il est arrêté et rejoint dans `Wh_ModBeforeUninit`, avant le retrait des hooks par Windhawk. Aucune application des hooks n'est faite depuis `Wh_ModInit` ni après le retour du callback préalable au déchargement.
 
 ## Paramètres
 
@@ -206,6 +234,11 @@ En mode `Custom hotkey`, `customProcessName` est requis pour détecter le foregr
 | `customHotkey` | vide | Texte | Hotkey optionnel: `win+alt+space`, `ctrl+space`, `alt+space`, etc. |
 | `customCommand` | vide | Texte | Exécutable, commande ou URI custom. |
 | `customCommandArgs` | vide | Texte | Arguments pour un exécutable custom. Ignoré pour les URI. |
+| `commandPalettePosition` | `default` | Combobox | Défaut, suivi horizontal de Démarrer, neuf positions ou pourcentages personnalisés. Seulement quand le mod ouvre Command Palette. |
+| `commandPaletteMonitor` | `launcher` | Combobox | Écran choisi par PowerToys, fenêtre source, souris ou écran principal. Le suivi de Démarrer utilise son écran. |
+| `commandPaletteMargin` | `16` | Nombre | Marge de la zone de travail ajustée au DPI, bornée à 0-200. |
+| `commandPaletteX` / `commandPaletteY` | `50` / `25` | Nombre | Mode personnalisé : déplacement horizontal/vertical, borné à 0-100 %. |
+| `instantStartDismiss` | `true` | Toggle | Factory native sans animation de StartMenu.dll pendant une redirection, si disponible. Hors transaction, Démarrer garde son comportement normal. |
 | `textCaptureDelayMs` | `0` | Nombre | Délai supplémentaire facultatif après vérification du champ de saisie. Borné à 0-2000 ms. |
 | `debounceMs` | `300` | Nombre | Anti double-lancement global. Borné à 0-5000 ms. |
 | `transitionCaptureMs` | `3500` | Nombre | Fenêtre max de capture pendant l'ouverture. Bornée à 50-10000 ms. |
@@ -262,6 +295,13 @@ Tests rapides:
 ```
 
 ## Historique
+
+### 1.0.4-dev
+
+- Placement facultatif de Command Palette, avec alignement horizontal sur le contrôle sémantique de Démarrer.
+- Fermeture native sans animation sur les builds compatibles de `StartMenu.dll`.
+- Correction du cycle d'installation tardive des hooks et d'arrêt du thread associé.
+- 21 assertions géométriques, 11 régressions bureau, six placements réels et captures comparatives image par image. Voir [les preuves et limites restantes](docs/presentation-investigation-2026-10-11.md).
 
 ### 1.0.3-dev
 

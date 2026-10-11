@@ -1,11 +1,14 @@
 // Real-desktop regression: a disposable edit control catches leaked input.
 // No Enter key is sent to the launcher and the clipboard is left untouched.
+#define _WIN32_WINNT 0x0A00
 #define wmain legacy_test_main
 #include "wh-test-input.cpp"
 #undef wmain
 #include <atomic>
 #include <thread>
 #include <dwmapi.h>
+#define SEARCH_REDIRECTOR_GEOMETRY_TEST
+#include "../src/replace-windows-search.wh.cpp"
 
 static HWND sinkWindow;
 static HWND sinkEdit;
@@ -100,7 +103,7 @@ static void FastText(const std::wstring& text, DWORD interval) {
     }
 }
 
-static bool ClickSemanticStartSearch(IUIAutomation* automation) {
+static bool ClickSemanticStartSearch(IUIAutomation* automation, RECT* boundsOnly = nullptr) {
     HWND hwnd = nullptr;
     while ((hwnd = FindWindowExW(nullptr, hwnd, L"Windows.UI.Core.CoreWindow", nullptr))) {
         DWORD pid = 0;
@@ -133,7 +136,9 @@ static bool ClickSemanticStartSearch(IUIAutomation* automation) {
             if (!offscreen && (type == UIA_ButtonControlTypeId || type == UIA_EditControlTypeId) &&
                 ((id && StrStrIW(id, L"Search")) || (name && StrStrIW(name, L"Rechercher")))) {
                 std::wprintf(L"search control id=%ls name=%ls\n", id ? id : L"", name ? name : L"");
-                ClickPoint((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2);
+                if (boundsOnly) *boundsOnly = rect;
+                else ClickPoint((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2);
+                std::printf("search_rect=%ld,%ld,%ld,%ld\n", rect.left, rect.top, rect.right, rect.bottom);
                 clicked = true;
             }
             SysFreeString(name); SysFreeString(id); element->Release();
@@ -171,6 +176,7 @@ static bool ReadLauncherText(IUIAutomation* automation, std::wstring* text, bool
 }
 
 int wmain(int argc, wchar_t** argv) {
+    SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     const std::wstring mode = argc > 1 ? argv[1] : L"typing";
     if (mode == L"shell-windows") {
         HWND hwnd = nullptr;
@@ -220,6 +226,7 @@ int wmain(int argc, wchar_t** argv) {
     }
 
     std::thread worker([&] {
+        SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         struct Completion { ~Completion() { finished = true; } } completion;
         CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         IUIAutomation* automation = nullptr;
@@ -228,7 +235,8 @@ int wmain(int argc, wchar_t** argv) {
         IUIAutomation2* timeouts = nullptr;
         if (SUCCEEDED(automation->QueryInterface(IID_PPV_ARGS(&timeouts)))) {
             timeouts->put_ConnectionTimeout(200);
-            timeouts->put_TransactionTimeout(mode == L"click" || mode == L"native-click" ? 2000 : 200);
+            timeouts->put_TransactionTimeout(mode == L"click" || mode == L"native-click" ||
+                mode == L"animation-typing" || mode == L"animation-click" || mode == L"position-followStart" ? 2000 : 200);
             timeouts->Release();
         }
         if (mode == L"wins" || mode == L"native-wins") {
@@ -249,8 +257,8 @@ int wmain(int argc, wchar_t** argv) {
             Sleep(800);
             result = StartVisible() && ForegroundName() != L"Microsoft.CmdPal.UI.exe" ? 0 : 1;
             std::printf("start-only %s\n", result == 0 ? "PASS" : "FAIL");
-        } else if (mode == L"click" || mode == L"native-click") {
-            Sleep(300);
+        } else if (mode == L"click" || mode == L"native-click" || mode == L"animation-click") {
+            Sleep(mode == L"animation-click" ? 1100 : 300);
             result = 1;
             if (ClickSemanticStartSearch(automation)) {
                 auto deadline = GetTickCount64() + 5000;
@@ -265,7 +273,17 @@ int wmain(int argc, wchar_t** argv) {
             }
             std::printf("search-click %s (no typing)\n", result == 0 ? "PASS" : "FAIL");
             if (result != 0) { PrintFocusedAutomation(); CaptureDesktop(); }
+            if (mode == L"animation-click") Sleep(500);
         } else {
+            RECT startSearch{};
+            if (mode == L"animation-typing" || mode == L"position-followStart") {
+                Sleep(800);
+                if (!ClickSemanticStartSearch(automation, &startSearch)) {
+                    std::puts("FAIL: Start anchor unavailable");
+                    automation->Release(); CoUninitialize(); result = 1; return;
+                }
+                Sleep(300);
+            }
             const auto begin = GetTickCount64();
             std::thread typer([&] { FastText(expected, 8); });
             ULONGLONG focusMs = 0, completeMs = 0;
@@ -282,6 +300,24 @@ int wmain(int argc, wchar_t** argv) {
                 mode.c_str(), focusMs, completeMs, expected.c_str(), actual.c_str());
             result = completeMs ? 0 : 1;
             if (!completeMs) CaptureDesktop();
+            if (completeMs && mode.find(L"position-") == 0) {
+                Sleep(150);
+                HWND hwnd = GetForegroundWindow();
+                RECT rect{};
+                MONITORINFO monitor{sizeof(monitor)};
+                GetWindowRect(hwnd, &rect);
+                GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &monitor);
+                auto preset = PalettePlacement::ParseMode(mode.substr(9).c_str());
+                POINT wanted = PalettePlacement::Calculate(preset, monitor.rcWork, rect,
+                    MulDiv(16, GetDpiForWindow(hwnd), 96), 50, 25,
+                    startSearch.right > startSearch.left ? &startSearch : nullptr);
+                bool placed = std::abs(rect.left - wanted.x) <= 2 && std::abs(rect.top - wanted.y) <= 2;
+                std::printf("placement %s actual=%ld,%ld wanted=%ld,%ld size=%ld,%ld dpi=%u\n",
+                    placed ? "PASS" : "FAIL", rect.left, rect.top, wanted.x, wanted.y,
+                    rect.right-rect.left, rect.bottom-rect.top, GetDpiForWindow(hwnd));
+                if (!placed) { result = 1; CaptureDesktop(); }
+            }
+            if (mode == L"animation-typing") Sleep(500);
         }
         PrintForeground();
         // Dismiss only the test surface, not an unrelated foreground application.

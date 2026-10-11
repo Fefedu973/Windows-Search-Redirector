@@ -2,7 +2,7 @@
 // @id              replace-windows-search-with-app
 // @name            Windows Search Redirector
 // @description     Redirects Windows Search to Command Palette, PowerToys Run, or a custom launcher and forwards initial text
-// @version         1.0.3-dev
+// @version         1.0.4-dev
 // @author          Fefedu973
 // @github          https://github.com/Fefedu973
 // @include         explorer.exe
@@ -25,8 +25,12 @@ Main interception layers:
 - `explorer.exe`: low-level keyboard/mouse hooks, Search protocol fallback,
   `SearchUx.UI.dll` and `twinui.pcshell.dll` hooks when those modules are loaded.
 - `StartMenuExperienceHost.exe`: `StartDocked.dll` hooks for Start menu search
-  transitions and Start search box pointer/tap paths.
+  transitions and Start search box pointer/tap paths; the newer `StartMenu.dll`
+  native no-animation dismissal factory during redirection, when available.
 - `SearchHost.exe`: `SearchUx.UI.dll` hooks for taskbar/SearchHost paths.
+
+Optional Command Palette placement includes screen edges, corners, custom
+percentages and horizontal alignment with the visible Start search bar.
 
 See the repository README for the full hook matrix, transaction diagrams,
 settings reference and testing commands.
@@ -71,6 +75,50 @@ settings reference and testing commands.
 - customCommandArgs: ""
   $name: Custom command arguments
   $description: Arguments passed to the custom executable, ignored for URI use.
+- commandPalettePosition: default
+  $name: Command Palette position
+  $description: >-
+    Applies only when this mod opens Command Palette. Default leaves PowerToys
+    in control. Follow Start horizontally centers on the visible Start search
+    bar and keeps the palette's vertical position; without Start, no move occurs.
+  $options:
+    - default: Default (controlled by PowerToys)
+    - followStart: Follow Start horizontally
+    - topLeft: Top left
+    - topCenter: Top center
+    - topRight: Top right
+    - centerLeft: Center left
+    - center: Center
+    - centerRight: Center right
+    - bottomLeft: Bottom left
+    - bottomCenter: Bottom center
+    - bottomRight: Bottom right
+    - custom: Custom percentages
+- commandPaletteMonitor: launcher
+  $name: Monitor for Command Palette positioning
+  $description: >-
+    Used for the fixed/custom positions. Follow Start uses the monitor containing
+    Start instead. Default positioning ignores this setting.
+  $options:
+    - launcher: Use PowerToys monitor selection
+    - source: Monitor of the window where search started
+    - mouse: Monitor with the mouse pointer
+    - primary: Primary monitor
+- commandPaletteMargin: 16
+  $name: Position margin (DPI-scaled pixels)
+  $description: Distance from the monitor work-area edges, excluding the taskbar. Range 0-200.
+- commandPaletteX: 50
+  $name: Custom horizontal position (%)
+  $description: Custom mode only. 0 is left, 50 is center, 100 is right, within the available window travel.
+- commandPaletteY: 25
+  $name: Custom vertical position (%)
+  $description: Custom mode only. 0 is top, 50 is center, 100 is bottom, within the available window travel.
+- instantStartDismiss: true
+  $name: Skip Start closing animation during redirection
+  $description: >-
+    Uses the native no-animation dismissal in the newer Windows 11 Start menu.
+    Normal Start opening/closing is unchanged. On unsupported Windows versions,
+    the normal closing animation is retained.
 - textCaptureDelayMs: 0
   $name: Additional text injection delay in milliseconds
   $description: >-
@@ -152,9 +200,57 @@ settings reference and testing commands.
 */
 // ==/WindhawkModSettings==
 
-#include <windhawk_utils.h>
-
 #include <windows.h>
+#include <algorithm>
+#include <cwchar>
+
+// Pure geometry shared verbatim with the standalone tests, without a second
+// runtime source file or a dependency on the Windhawk engine in those tests.
+namespace PalettePlacement {
+enum class Mode {
+    Default, FollowStart, TopLeft, TopCenter, TopRight, CenterLeft, Center,
+    CenterRight, BottomLeft, BottomCenter, BottomRight, Custom,
+};
+
+static Mode ParseMode(PCWSTR value) {
+    const PCWSTR names[] = {L"default", L"followStart", L"topLeft", L"topCenter",
+        L"topRight", L"centerLeft", L"center", L"centerRight", L"bottomLeft",
+        L"bottomCenter", L"bottomRight", L"custom"};
+    for (size_t i = 0; i < ARRAYSIZE(names); ++i) {
+        if (value && wcscmp(value, names[i]) == 0) return static_cast<Mode>(i);
+    }
+    return Mode::Default;
+}
+
+static POINT Calculate(Mode mode, const RECT& work, const RECT& window,
+                       int margin, int xPercent, int yPercent,
+                       const RECT* startSearch = nullptr) {
+    POINT unchanged{window.left, window.top};
+    if (mode == Mode::Default || work.right <= work.left || work.bottom <= work.top ||
+        (mode == Mode::FollowStart && !startSearch)) return unchanged;
+    LONG width = window.right - window.left, height = window.bottom - window.top;
+    LONG spaceX = std::max<LONG>(0, work.right - work.left - width);
+    LONG spaceY = std::max<LONG>(0, work.bottom - work.top - height);
+    LONG mx = std::clamp<LONG>(margin, 0, spaceX / 2);
+    LONG my = std::clamp<LONG>(margin, 0, spaceY / 2);
+    if (mode == Mode::FollowStart) {
+        return {std::clamp<LONG>(startSearch->left +
+                    (startSearch->right - startSearch->left - width) / 2,
+                    work.left + mx, work.left + spaceX - mx),
+                std::clamp<LONG>(window.top, work.top + my, work.top + spaceY - my)};
+    }
+    if (mode != Mode::Custom) {
+        int cell = static_cast<int>(mode) - static_cast<int>(Mode::TopLeft);
+        xPercent = (cell % 3) * 50;
+        yPercent = (cell / 3) * 50;
+    }
+    return {work.left + mx + MulDiv(spaceX - 2 * mx, std::clamp(xPercent, 0, 100), 100),
+            work.top + my + MulDiv(spaceY - 2 * my, std::clamp(yPercent, 0, 100), 100)};
+}
+}  // namespace PalettePlacement
+
+#ifndef SEARCH_REDIRECTOR_GEOMETRY_TEST
+#include <windhawk_utils.h>
 #include <dwmapi.h>
 #include <initguid.h>
 #include <shlwapi.h>
@@ -169,7 +265,6 @@ settings reference and testing commands.
 #include <winrt/Windows.UI.Xaml.Input.h>
 #include <winrt/Windows.UI.Xaml.Media.h>
 
-#include <algorithm>
 #include <atomic>
 #include <cstdarg>
 #include <cwctype>
@@ -191,6 +286,11 @@ enum class LauncherTarget {
 };
 
 struct SettingsSnapshot {
+    PalettePlacement::Mode palettePosition = PalettePlacement::Mode::Default;
+    std::wstring paletteMonitor = L"launcher";
+    int paletteMargin = 16;
+    int paletteX = 50;
+    int paletteY = 25;
     DWORD debounceMs = 300;
     DWORD textCaptureDelayMs = 0;
     DWORD transitionCaptureMs = 3500;
@@ -218,6 +318,7 @@ struct SettingsSnapshot {
 static SRWLOCK g_settingsLock = SRWLOCK_INIT;
 static SettingsSnapshot g_settings;
 static volatile LONG g_logEnabled = 0;
+static volatile LONG g_instantStartDismiss = 1;
 static volatile LONG g_redirectWinSEnabled = 1;
 static volatile LONG g_redirectWinQEnabled = 1;
 static volatile LONG g_redirectWinCEnabled = 1;
@@ -293,6 +394,12 @@ static void LoadSettings() {
 
     SettingsSnapshot next;
 
+    next.palettePosition = PalettePlacement::ParseMode(readStringSetting(L"commandPalettePosition").c_str());
+    next.paletteMonitor = readStringSetting(L"commandPaletteMonitor");
+    next.paletteMargin = std::clamp(Wh_GetIntSetting(L"commandPaletteMargin"), 0, 200);
+    next.paletteX = std::clamp(Wh_GetIntSetting(L"commandPaletteX"), 0, 100);
+    next.paletteY = std::clamp(Wh_GetIntSetting(L"commandPaletteY"), 0, 100);
+
     std::wstring launcher = readStringSetting(L"launcher");
     std::transform(launcher.begin(), launcher.end(), launcher.begin(),
                    [](wchar_t ch) { return static_cast<wchar_t>(towlower(ch)); });
@@ -341,6 +448,8 @@ static void LoadSettings() {
     next.redirectSearchProtocol =
         Wh_GetIntSetting(L"redirectSearchProtocol") != 0;
     bool logEnabled = Wh_GetIntSetting(L"log") != 0;
+    InterlockedExchange(&g_instantStartDismiss,
+                        Wh_GetIntSetting(L"instantStartDismiss") != 0);
 
     next.customHotkey = readStringSetting(L"customHotkey");
     next.customCommand = readStringSetting(L"customCommand");
@@ -1300,6 +1409,7 @@ static volatile LONG g_activeLaunchThreads = 0;
 static SRWLOCK g_launchTrackingLock = SRWLOCK_INIT;
 static std::atomic<bool> g_searchUxSymbolsHooked = false;
 static std::atomic<bool> g_startDockedSymbolsHooked = false;
+static std::atomic<bool> g_modernStartSymbolsChecked = false;
 static std::atomic<bool> g_twinuiSymbolsHooked = false;
 static volatile LONG64 g_ignoreUndockedSearchUntilTick = 0;
 
@@ -2699,6 +2809,122 @@ static void WaitForLaunchThreadsAndCloseTracking() {
     ReleaseSRWLockExclusive(&g_launchTrackingLock);
 }
 
+class PhysicalCoordinatesScope {
+    DPI_AWARENESS_CONTEXT previous_ = nullptr;
+public:
+    explicit PhysicalCoordinatesScope(bool enabled) {
+        if (enabled) previous_ = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+    ~PhysicalCoordinatesScope() {
+        if (previous_) SetThreadDpiAwarenessContext(previous_);
+    }
+};
+
+static bool ReadVisibleStartSearchBounds(RECT* bounds) {
+    HWND start = nullptr;
+    while ((start = FindWindowExW(nullptr, start, L"Windows.UI.Core.CoreWindow", nullptr))) {
+        DWORD pid = 0, cloaked = 0;
+        GetWindowThreadProcessId(start, &pid);
+        if (!IsWindowVisible(start) ||
+            _wcsicmp(GetProcessNameFromPid(pid).c_str(), L"StartMenuExperienceHost.exe") ||
+            FAILED(DwmGetWindowAttribute(start, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) || cloaked) continue;
+        winrt::com_ptr<IUIAutomation> automation;
+        if (FAILED(CoCreateInstance(CLSID_CUIAutomation8, nullptr, CLSCTX_INPROC_SERVER,
+                                    IID_PPV_ARGS(automation.put())))) return false;
+        auto timeouts = automation.try_as<IUIAutomation2>();
+        if (!timeouts) return false;
+        timeouts->put_ConnectionTimeout(100);
+        timeouts->put_TransactionTimeout(100);
+        winrt::com_ptr<IUIAutomationElement> root, search;
+        winrt::com_ptr<IUIAutomationCondition> idCondition, visibleCondition, condition;
+        VARIANT id{};
+        id.vt = VT_BSTR;
+        id.bstrVal = SysAllocString(L"SearchBoxToggleButton");
+        if (!id.bstrVal) return false;
+        HRESULT hr = automation->CreatePropertyCondition(UIA_AutomationIdPropertyId, id, idCondition.put());
+        VariantClear(&id);
+        VARIANT visible{};
+        visible.vt = VT_BOOL;
+        visible.boolVal = VARIANT_FALSE;
+        if (FAILED(hr) || FAILED(automation->CreatePropertyCondition(UIA_IsOffscreenPropertyId,
+                visible, visibleCondition.put())) ||
+            FAILED(automation->CreateAndCondition(idCondition.get(), visibleCondition.get(), condition.put())) ||
+            FAILED(automation->ElementFromHandle(start, root.put())) || !root ||
+            FAILED(root->FindFirst(TreeScope_Descendants, condition.get(), search.put())) || !search ||
+            FAILED(search->get_CurrentBoundingRectangle(bounds))) return false;
+        // Start's top-level HWND spans the screen. The semantic search control
+        // identifies the actual main panel, excluding the phone companion.
+        return bounds->right > bounds->left && bounds->bottom > bounds->top;
+    }
+    return false;
+}
+
+struct PalettePositionContext {
+    HMONITOR monitor = nullptr;
+    RECT startSearch{};
+    bool hasStart = false;
+    HWND movedWindow = nullptr;
+    UINT lastDpi = 0;
+    ULONGLONG firstMoveTick = 0;
+    int moves = 0;
+};
+
+static PalettePositionContext CapturePalettePositionContext(
+    const SettingsSnapshot& settings, HWND source) {
+    PalettePositionContext context;
+    if (settings.launcherTarget != LauncherTarget::CommandPalette ||
+        settings.palettePosition == PalettePlacement::Mode::Default) return context;
+    if (settings.palettePosition == PalettePlacement::Mode::FollowStart) {
+        context.hasStart = ReadVisibleStartSearchBounds(&context.startSearch);
+        if (context.hasStart) context.monitor = MonitorFromRect(&context.startSearch, MONITOR_DEFAULTTONEAREST);
+        log_if(L"Palette Start anchor available=%d rect=%ld,%ld,%ld,%ld", context.hasStart,
+               context.startSearch.left, context.startSearch.top, context.startSearch.right, context.startSearch.bottom);
+    } else if (settings.paletteMonitor == L"source") {
+        context.monitor = MonitorFromWindow(source, MONITOR_DEFAULTTONEAREST);
+    } else if (settings.paletteMonitor == L"mouse") {
+        POINT mouse{};
+        if (GetCursorPos(&mouse)) context.monitor = MonitorFromPoint(mouse, MONITOR_DEFAULTTONEAREST);
+    } else if (settings.paletteMonitor == L"primary") {
+        context.monitor = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+    }
+    return context;
+}
+
+static void ApplyPalettePosition(const SettingsSnapshot& settings, PalettePositionContext* context) {
+    if (IsUnloading() || settings.launcherTarget != LauncherTarget::CommandPalette ||
+        settings.palettePosition == PalettePlacement::Mode::Default ||
+        (settings.palettePosition == PalettePlacement::Mode::FollowStart && !context->hasStart)) return;
+    HWND hwnd = GetForegroundWindow();
+    DWORD pid = 0, cloaked = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    wchar_t windowClass[128]{};
+    GetClassNameW(hwnd, windowClass, ARRAYSIZE(windowClass));
+    if (_wcsicmp(GetProcessNameFromPid(pid).c_str(), L"Microsoft.CmdPal.UI.exe") ||
+        wcscmp(windowClass, L"WinUIDesktopWin32WindowClass") || !IsWindowVisible(hwnd) ||
+        FAILED(DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) || cloaked) return;
+    UINT dpi = GetDpiForWindow(hwnd);
+    if (!dpi) return;
+    // One initial move; only a resulting cross-monitor DPI change may cause a
+    // bounded correction. Never keep pulling a user-dragged window back.
+    if (context->moves && (hwnd != context->movedWindow || dpi == context->lastDpi ||
+        context->moves >= 3 || GetTickCount64() - context->firstMoveTick > 200)) return;
+    RECT rect{};
+    MONITORINFO monitor{sizeof(monitor)};
+    HMONITOR target = context->monitor ? context->monitor : MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    if (!GetWindowRect(hwnd, &rect) || !GetMonitorInfoW(target, &monitor)) return;
+    POINT position = PalettePlacement::Calculate(settings.palettePosition, monitor.rcWork, rect,
+        MulDiv(settings.paletteMargin, dpi, 96), settings.paletteX, settings.paletteY,
+        context->hasStart ? &context->startSearch : nullptr);
+    if (SetWindowPos(hwnd, nullptr, position.x, position.y, 0, 0,
+                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_ASYNCWINDOWPOS)) {
+        if (!context->moves) context->firstMoveTick = GetTickCount64();
+        context->movedWindow = hwnd;
+        context->lastDpi = dpi;
+        ++context->moves;
+        log_if(L"Palette position requested x=%ld y=%ld dpi=%u", position.x, position.y, dpi);
+    }
+}
+
 static DWORD WINAPI LaunchThreadProc(LPVOID) {
     LaunchThreadLifetime lifetime;
     struct ComLifetime {
@@ -2710,6 +2936,14 @@ static DWORD WINAPI LaunchThreadProc(LPVOID) {
     const auto started = GetTickCount64();
     const auto foreground = CaptureForegroundSnapshot();
     const bool alreadyForeground = IsConfiguredReplacementForegroundProcess(foreground.processName, settings);
+    const bool positionEnabled = !alreadyForeground &&
+        settings.launcherTarget == LauncherTarget::CommandPalette &&
+        settings.palettePosition != PalettePlacement::Mode::Default;
+    PhysicalCoordinatesScope coordinates(positionEnabled);
+    // Snapshot Start before the URI summon can deactivate it, never in the
+    // low-level keyboard callback. Default placement performs no UIA lookup.
+    PalettePositionContext position;
+    if (positionEnabled) position = CapturePalettePositionContext(settings, foreground.hwnd);
 
     if (IsUnloading() || (!alreadyForeground && !OpenReplacementWindow(settings)) ||
         !WaitForLauncherInputReady(settings)) {
@@ -2723,6 +2957,7 @@ static DWORD WINAPI LaunchThreadProc(LPVOID) {
         return 0;
     }
     log_if(L"Launcher input ready after %llu ms", GetTickCount64() - started);
+    if (positionEnabled) ApplyPalettePosition(settings, &position);
 
     if (settings.textCaptureDelayMs > 0 &&
         !SleepUnlessUnloading(settings.textCaptureDelayMs)) {
@@ -2740,6 +2975,7 @@ static DWORD WINAPI LaunchThreadProc(LPVOID) {
         }
 
         ForegroundSnapshot current = CaptureForegroundSnapshot();
+        if (positionEnabled) ApplyPalettePosition(settings, &position);
         if (!IsConfiguredReplacementForegroundProcess(current.processName,
                                                       settings)) {
             PendingTextBatch batch = ConsumePendingTextBatch();
@@ -3522,6 +3758,40 @@ static BOOL WINAPI ShellExecuteExW_Hook(SHELLEXECUTEINFOW* execInfo) {
 
 // -------------------- Symbol hook setup --------------------
 
+// x64 member ABI: RCX = AnimationProvider, RDX = caller-owned WinRT return
+// storage. Both native factories have the identical return type and ABI. Keep
+// Windows' animation completion/state management; never hide its HWND manually.
+using CreateDismissAnimation_t = void*(WINAPI*)(void*, void*);
+static CreateDismissAnimation_t CreateDismissAnimation_Original;
+static CreateDismissAnimation_t CreateDismissNoAnimation;
+
+static void* WINAPI CreateDismissAnimation_Hook(void* provider, void* result) {
+    if (!IsUnloading() && CreateDismissNoAnimation && g_sharedState &&
+        InterlockedCompareExchange(&g_instantStartDismiss, 0, 0) &&
+        InterlockedCompareExchange(&g_sharedState->launchInProgress, 0, 0)) {
+        log_if(L"StartMenu: selecting native CreateDismissNoAnimation");
+        return CreateDismissNoAnimation(provider, result);
+    }
+    return CreateDismissAnimation_Original(provider, result);
+}
+
+static bool TryHookModernStartSymbols() {
+    if (g_modernStartSymbolsChecked.load()) return true;
+    HMODULE module = GetModuleHandleW(L"StartMenu.dll");
+    if (!module) return false;
+    WindhawkUtils::SYMBOL_HOOK symbols[] = {
+        {{LR"(public: struct winrt::Windows::UI::Composition::ScalarKeyFrameAnimation __cdecl winrt::StartMenu::implementation::Animations::AnimationProvider::CreateDismissNoAnimation(void))"},
+         &CreateDismissNoAnimation, nullptr, true},
+        {{LR"(public: struct winrt::Windows::UI::Composition::ScalarKeyFrameAnimation __cdecl winrt::StartMenu::implementation::Animations::AnimationProvider::CreateDismissAnimation(void))"},
+         &CreateDismissAnimation_Original, CreateDismissAnimation_Hook, true},
+    };
+    bool ok = WindhawkUtils::HookSymbols(module, symbols, ARRAYSIZE(symbols));
+    g_modernStartSymbolsChecked.store(true);
+    Wh_Log(L"[ReplaceSearch] Native Start dismissal hook available=%d",
+           ok && CreateDismissNoAnimation && CreateDismissAnimation_Original);
+    return true;
+}
+
 static bool HookStartDockedSymbols() {
     HMODULE module = GetModuleHandleW(L"StartDocked.dll");
     if (!module) {
@@ -3854,11 +4124,16 @@ static bool TryHookSearchUxSymbols() {
 
 static DWORD WINAPI ModuleWatcherThreadProc(LPVOID) {
     while (WaitForSingleObject(g_moduleWatcherStopEvent, 200) == WAIT_TIMEOUT) {
+        const bool hadDocked = g_startDockedSymbolsHooked.load();
+        const bool hadModern = g_modernStartSymbolsChecked.load();
+        const bool hadTwinui = g_twinuiSymbolsHooked.load();
+        const bool hadSearchUx = g_searchUxSymbolsHooked.load();
         bool done = true;
 
         switch (g_targetProcess) {
             case TargetProcess::Explorer:
-                done = TryHookSearchUxSymbols() && TryHookTwinuiSymbols();
+                done = TryHookSearchUxSymbols();
+                done = TryHookTwinuiSymbols() && done;
                 break;
 
             case TargetProcess::SearchHost:
@@ -3867,10 +4142,18 @@ static DWORD WINAPI ModuleWatcherThreadProc(LPVOID) {
 
             case TargetProcess::StartMenu:
                 done = TryHookStartDockedSymbols();
+                done = TryHookModernStartSymbols() && done;
                 break;
 
             default:
                 return 0;
+        }
+
+        if (hadDocked != g_startDockedSymbolsHooked.load() ||
+            hadModern != g_modernStartSymbolsChecked.load() ||
+            hadTwinui != g_twinuiSymbolsHooked.load() ||
+            hadSearchUx != g_searchUxSymbolsHooked.load()) {
+            Wh_ApplyHookOperations();
         }
 
         if (done) {
@@ -3956,24 +4239,15 @@ BOOL Wh_ModInit() {
             anyHooked = TryHookSearchUxSymbols();
             anyHooked = TryHookTwinuiSymbols() || anyHooked;
             HookSearchProtocolFallback();
-            if (!g_searchUxSymbolsHooked.load() ||
-                !g_twinuiSymbolsHooked.load()) {
-                StartModuleWatcherThread();
-            }
             break;
 
         case TargetProcess::StartMenu:
             anyHooked = TryHookStartDockedSymbols();
-            if (!g_startDockedSymbolsHooked.load()) {
-                StartModuleWatcherThread();
-            }
+            TryHookModernStartSymbols();
             break;
 
         case TargetProcess::SearchHost:
             anyHooked = TryHookSearchUxSymbols();
-            if (!g_searchUxSymbolsHooked.load()) {
-                StartModuleWatcherThread();
-            }
             break;
 
         default:
@@ -3983,6 +4257,18 @@ BOOL Wh_ModInit() {
     log_if(L"Initialized in %s (hooks=%d)", GetCurrentProcessName().c_str(),
            anyHooked ? 1 : 0);
     return TRUE;
+}
+
+void Wh_ModAfterInit() {
+    // Late-loaded modules require an explicit Wh_ApplyHookOperations, which
+    // must not run until Wh_ModInit has returned.
+    StartModuleWatcherThread();
+}
+
+void Wh_ModBeforeUninit() {
+    // Windhawk forbids registering/applying hooks after this callback returns.
+    // Waiting in Wh_ModUninit would race with the engine's hook removal.
+    StopModuleWatcherThread();
 }
 
 void Wh_ModUninit() {
@@ -4002,3 +4288,4 @@ void Wh_ModUninit() {
 void Wh_ModSettingsChanged() {
     LoadSettings();
 }
+#endif  // SEARCH_REDIRECTOR_GEOMETRY_TEST
